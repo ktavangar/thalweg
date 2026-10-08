@@ -1,4 +1,10 @@
-__all__ = ["IsochroneCMD"]
+__all__ = [
+    "IsochroneCMD",
+    "KROUPA_SLOPES",
+    "KROUPA_BREAKS",
+    "SALPETER_SLOPES",
+    "SALPETER_BREAKS",
+]
 
 from typing import Any
 
@@ -8,6 +14,15 @@ import numpyro.distributions as dist
 from jax import lax
 from jax.typing import ArrayLike
 from jax_cosmo.scipy.interpolate import InterpolatedUnivariateSpline
+
+from .selection_function import _bilinear_interp
+
+# Broken power-law initial mass functions, dN/dm ~ m**(-alpha_i) in each mass
+# segment (masses in Msun; slopes has one more entry than breaks).
+KROUPA_SLOPES = (0.3, 1.3, 2.3)  # Kroupa (2001)
+KROUPA_BREAKS = (0.08, 0.5)
+SALPETER_SLOPES = (2.35,)  # Salpeter (1955)
+SALPETER_BREAKS = ()
 
 
 def _clip_preserve_gradients(x, min_, max_):
@@ -24,6 +39,23 @@ def _eval_poly(coeffs: ArrayLike, x: ArrayLike) -> jax.Array:
 
     result, _ = lax.scan(body, jnp.zeros_like(x, dtype=coeffs.dtype), coeffs)
     return result
+
+
+def _log_imf(mass, slopes, breaks):
+    """Log of a *continuous* broken power-law IMF (up to a constant):
+    ``xi(m) ~ m**(-slopes[i])`` between ``breaks[i-1]`` and ``breaks[i]``."""
+    slopes = tuple(float(a) for a in slopes)
+    breaks = tuple(float(b) for b in breaks)
+    if len(slopes) != len(breaks) + 1:
+        msg = "imf_slopes must have exactly one more entry than imf_breaks."
+        raise ValueError(msg)
+    logm = jnp.log(mass)
+    out = -slopes[0] * logm
+    for i, b in enumerate(breaks):
+        out = out + jnp.where(
+            mass > b, -(slopes[i + 1] - slopes[i]) * (logm - jnp.log(b)), 0.0
+        )
+    return out
 
 
 class IsochroneCMD(dist.Distribution):
@@ -96,6 +128,67 @@ class IsochroneCMD(dist.Distribution):
         (piecewise-linear), since isochrone tracks are typically sampled
         densely enough that higher-order interpolation isn't needed and a
         linear spline is guaranteed not to introduce spurious wiggles.
+    track_mass (optional)
+        Array of initial stellar masses (Msun) at each track point (same
+        length/order as ``track_abs_mag``; saved as ``initial_mass`` by
+        ``generate_stream_isochrone.py``). If given, the marginal density in
+        absolute magnitude is a real luminosity function instead of uniform:
+        ``dN/dM = xi(m) |dm/dM|`` for an initial mass function ``xi`` (see
+        ``imf_slopes``/``imf_breaks``), evaluated robustly as the IMF-weighted
+        number of stars per ``lf_smooth``-mag bin along the track (no noisy
+        finite derivatives). This matters a lot for the mixture model: a flat
+        luminosity function puts most of the stream's mass at sparse bright
+        magnitudes (giants, subgiants) and underweights the faint main
+        sequence where nearly all observed stream stars live, so the CMD
+        coordinate's likelihood actively disfavors a non-zero stream
+        fraction. Defaults to ``None`` (uniform; exact old behavior).
+    imf_slopes, imf_breaks (optional)
+        Slopes ``alpha_i`` (``dN/dm ~ m**-alpha_i``) and mass breaks (Msun) of
+        the broken power-law IMF used when ``track_mass`` is given. Default
+        Kroupa (2001): slopes ``(0.3, 1.3, 2.3)``, breaks ``(0.08, 0.5)``.
+        For Salpeter use ``imf_slopes=(2.35,)``, ``imf_breaks=()`` (see
+        ``SALPETER_SLOPES``/``SALPETER_BREAKS``). Static (not fitted).
+    lf_smooth (optional)
+        Absolute-magnitude bin width (mag) over which the luminosity function
+        is averaged, default 0.1.
+    off_track_scale (optional)
+        How the density behaves for a star whose implied absolute magnitude
+        falls outside the isochrone track's range. ``None`` (default; old
+        behavior): the density is held CONSTANT beyond the track ends (with
+        straight-through gradients), which avoids ``-inf`` losses but has two
+        pathologies: that density is unnormalized (it is not counted in
+        ``Z``), and a large ``|dm_offset|`` can slide the whole track away so
+        that every star sits in this free constant region -- a degenerate
+        "outlier" solution (observed: ``dm_offset`` running to -16 while the
+        loss climbs, because the straight-through gradient no longer
+        descends the real loss). A float (mag, e.g. 0.3) instead multiplies
+        the density by ``exp(-0.5 (excess / off_track_scale)^2)``, where
+        ``excess`` is how far outside the track range the star's absolute
+        magnitude is, and uses ordinary (true-gradient) clipping: still
+        finite and smooth, but the penalty is steep, genuine, and
+        normalizable, so the track cannot be slid away from the data.
+    selection_function (optional)
+        A fixed (non-learned) :class:`~stream_membership.distributions.selection_function.MagLimSelectionFunction`
+        (or any object exposing ``log_S(mag, phi1, phi2)`` plus
+        ``phi1_nodes``/``phi2_nodes`` attributes), used to correct this
+        term's density for survey incompleteness at faint magnitudes. This is
+        needed here -- unlike for the background's ``CalibratedFlowDensity``
+        term -- because this distribution is a fixed *physical* model of the
+        stream's true, pre-selection population, not a density estimator fit
+        directly to already-selection-thinned data. Renormalization is
+        ``p_obs(M) = p_true(M) S(M + dm) / Z`` with
+        ``Z(phi1, phi2) = \int p_true(M) S(M + dm(phi1)) dM`` computed by
+        quadrature over the track's absolute-magnitude range with the
+        luminosity-function weights (on a coarse phi1 x phi2 grid, then
+        bilinearly interpolated to each star), so the phi1-dependent
+        distance modulus (and the fitted ``dm_offset``) is accounted for and
+        the result integrates to 1 over observed (mag, color). Defaults to
+        ``None``: no selection correction, no ``phi2`` required.
+    phi2 (optional)
+        Array of phi2 values (degrees), needed only if ``selection_function``
+        is provided. Follows the same fixed-at-construction-but-overridable-
+        per-call convention as ``x``. Ignored if ``selection_function`` is
+        ``None``.
     """
 
     support = dist.constraints.real_vector
@@ -110,6 +203,13 @@ class IsochroneCMD(dist.Distribution):
         color_offset: ArrayLike = 0.0,
         color_scale: ArrayLike = 0.05,
         spline_k: int = 1,
+        selection_function: Any | None = None,
+        phi2: ArrayLike | None = None,
+        track_mass: ArrayLike | None = None,
+        imf_slopes: tuple[float, ...] = KROUPA_SLOPES,
+        imf_breaks: tuple[float, ...] = KROUPA_BREAKS,
+        lf_smooth: float = 0.1,
+        off_track_scale: float | None = None,
         validate_args: bool | None = None,
     ) -> None:
         x = jnp.asarray(x)
@@ -125,6 +225,8 @@ class IsochroneCMD(dist.Distribution):
         self.color_offset = color_offset
         self.color_scale = color_scale
         self.spline_k = spline_k
+        self.selection_function = selection_function
+        self.phi2 = None if phi2 is None else jnp.asarray(phi2)
 
         # InterpolatedUnivariateSpline requires strictly increasing knots;
         # isochrone tracks are typically ordered so abs_mag is *decreasing*
@@ -151,10 +253,41 @@ class IsochroneCMD(dist.Distribution):
         self._abs_mag_min = jnp.min(self.track_abs_mag)
         self._abs_mag_max = jnp.max(self.track_abs_mag)
 
+        # --- luminosity function (absolute-magnitude marginal) ---------------
+        # Fixed (track-only) quadrature grid in absolute magnitude, used both
+        # for the LF density and for Z(phi1, phi2) when a selection function
+        # is attached. Everything here is built with jnp ops only (no Python
+        # control flow on values), for the same tracing reason as above.
+        self.off_track_scale = None if off_track_scale is None else float(off_track_scale)
+        self.imf_slopes = tuple(float(a) for a in imf_slopes)
+        self.imf_breaks = tuple(float(b) for b in imf_breaks)
+        self._has_lf = track_mass is not None
+        n_q = 400
+        self._M_q = self._abs_mag_min + (self._abs_mag_max - self._abs_mag_min) * jnp.linspace(0.0, 1.0, n_q)
+        if self._has_lf:
+            mass = jnp.asarray(track_mass)
+            mass_sorted = jnp.where(is_decreasing, mass[::-1], mass)  # aligned with _abs_mag_sorted
+            xi = jnp.exp(_log_imf(mass_sorted, self.imf_slopes, self.imf_breaks))
+            dn = 0.5 * (xi[1:] + xi[:-1]) * jnp.abs(mass_sorted[1:] - mass_sorted[:-1])
+            n_cum = jnp.concatenate([jnp.zeros(1), jnp.cumsum(dn)])  # monotone in M
+            half = 0.5 * lf_smooth
+            lo = jnp.maximum(self._M_q - half, self._abs_mag_min)
+            hi = jnp.minimum(self._M_q + half, self._abs_mag_max)
+            w = (jnp.interp(hi, self._abs_mag_sorted, n_cum) - jnp.interp(lo, self._abs_mag_sorted, n_cum)) / (hi - lo)
+            self._w_q = jnp.maximum(w, 1e-12 * jnp.max(w))
+        else:
+            self._w_q = jnp.ones_like(self._M_q)
+        self._w_norm = jnp.trapezoid(self._w_q, self._M_q)
+
     def _distmod(self, x: ArrayLike) -> jax.Array:
         return _eval_poly(self.distmod_coeffs, jnp.asarray(x)) + self.dm_offset
 
-    def log_prob(self, value: ArrayLike, x: ArrayLike | None = None) -> jax.Array | Any:
+    def log_prob(
+        self,
+        value: ArrayLike,
+        x: ArrayLike | None = None,
+        phi2: ArrayLike | None = None,
+    ) -> jax.Array | Any:
         """
         Evaluates the log probability density for a batch of (magnitude1,
         magnitude2) samples, e.g. ``(PS_g, PS_r)``.
@@ -171,6 +304,10 @@ class IsochroneCMD(dist.Distribution):
             Array of phi1 values at which to evaluate the distance modulus.
             If not provided, the ``x`` values provided at initialization
             will be used.
+        phi2
+            Array of phi2 values, only used (and only required, from either
+            here or construction time) if ``self.selection_function`` is not
+            ``None``. Ignored otherwise.
         """
         x = self.x if x is None else jnp.asarray(x)
         value = jnp.asarray(value)
@@ -204,20 +341,64 @@ class IsochroneCMD(dist.Distribution):
         # A star sitting off the track now pulls the fit back via the
         # (smooth, always-finite) color-mismatch term instead of a hard
         # -inf cliff.
-        clipped_abs_mag = _clip_preserve_gradients(
-            abs_mag, self._abs_mag_min, self._abs_mag_max
-        )
+        if self.off_track_scale is None:
+            clipped_abs_mag = _clip_preserve_gradients(
+                abs_mag, self._abs_mag_min, self._abs_mag_max
+            )
+        else:
+            clipped_abs_mag = jnp.clip(abs_mag, self._abs_mag_min, self._abs_mag_max)
         pred_color = self._color_spl(clipped_abs_mag) + self.color_offset
 
         color_lp = dist.Normal(loc=pred_color, scale=self.color_scale).log_prob(
             color_obs
         )
-        # Uniform marginal density in absolute magnitude over the track's
-        # valid range -- see IsochroneCMD's docstring for why a full
-        # population luminosity function isn't modeled here.
-        mag_lp = -jnp.log(self._abs_mag_max - self._abs_mag_min)
+        if self._has_lf:
+            # Real luminosity function (IMF-weighted), normalized over the
+            # track's absolute-magnitude range.
+            w_obs = jnp.interp(clipped_abs_mag, self._M_q, self._w_q)
+            mag_lp = jnp.log(w_obs) - jnp.log(self._w_norm)
+        else:
+            # Uniform marginal density in absolute magnitude over the track's
+            # valid range (old behavior; pass `track_mass` for a real LF).
+            mag_lp = -jnp.log(self._abs_mag_max - self._abs_mag_min)
 
-        return color_lp + mag_lp
+        if self.off_track_scale is not None:
+            excess = abs_mag - clipped_abs_mag
+            mag_lp = mag_lp - 0.5 * (excess / self.off_track_scale) ** 2
+
+        if self.selection_function is None:
+            return color_lp + mag_lp
+
+        # Selection-function correction:
+        #   p_obs = p_true * S / Z,   Z(phi1, phi2) = int p_true(M) S(M + dm) dM
+        # (renormalizing this component's density before it's mixed with any
+        # other components -- see IsochroneCMD's docstring). S depends on the
+        # observed apparent magnitude (not absolute), and on sky position.
+        phi2_ = self.phi2 if phi2 is None else jnp.asarray(phi2)
+        if phi2_ is None:
+            msg = (
+                "self.selection_function is not None, so a `phi2` array is "
+                "required -- either pass it at construction or as a "
+                "log_prob(..., phi2=...) argument."
+            )
+            raise ValueError(msg)
+
+        log_s = self.selection_function.log_S(mag_obs, x, phi2_)
+        return color_lp + mag_lp + log_s - self._log_Z(x, phi2_)
+
+    def _log_Z(self, x: ArrayLike, phi2: ArrayLike) -> jax.Array:
+        """log Z(phi1, phi2): the selection-weighted mass of the true
+        (pre-selection) population, by quadrature on a coarse phi1 x phi2
+        grid (using the current distance-modulus offset), bilinearly
+        interpolated to the requested positions."""
+        sf = self.selection_function
+        p1 = jnp.linspace(sf.phi1_nodes[0], sf.phi1_nodes[-1], 64)
+        p2 = jnp.asarray(sf.phi2_nodes)
+        dm_g = self._distmod(p1)  # (64,)
+        mag = self._M_q[None, None, :] + dm_g[:, None, None]
+        s_grid = jnp.exp(sf.log_S(mag, p1[:, None, None], p2[None, :, None]))  # (64, n2, Q)
+        z = jnp.trapezoid(s_grid * self._w_q, self._M_q, axis=-1) / self._w_norm
+        return _bilinear_interp(p1, p2, jnp.log(jnp.maximum(z, 1e-300)), x, phi2)
 
     def sample(
         self,
@@ -233,6 +414,15 @@ class IsochroneCMD(dist.Distribution):
         modulus and converted back to the raw (magnitude1, magnitude2)
         pair (``magnitude1`` = apparent magnitude, ``magnitude2`` =
         ``magnitude1 - color``).
+
+        NOTE: intentionally does NOT draw selection-thinned samples even if
+        ``self.selection_function`` is set -- it always draws from the
+        "true", pre-selection track density. This method isn't used inside
+        the SVI likelihood path (only ``log_prob`` is), so this doesn't
+        affect fits; it only matters if you use ``.sample()`` directly for
+        mock-catalog generation or predictive checks, in which case you'd
+        currently need to apply the thinning (e.g. rejection sampling
+        against ``selection_function.log_S``) yourself. Left as future work.
         """
         # NOTE: a per-call `x` must *fully* override the batch shape (matching
         # `log_prob`'s convention, and the sibling `NormalSpline.sample`),
@@ -249,9 +439,16 @@ class IsochroneCMD(dist.Distribution):
         shape = tuple(sample_shape) + x.shape
 
         key_mag, key_color = jax.random.split(key)
-        abs_mag = jax.random.uniform(
-            key_mag, shape, minval=self._abs_mag_min, maxval=self._abs_mag_max
-        )
+        if self._has_lf:
+            cdf = jnp.concatenate(
+                [jnp.zeros(1), jnp.cumsum(0.5 * (self._w_q[1:] + self._w_q[:-1]) * jnp.diff(self._M_q))]
+            )
+            cdf = cdf / cdf[-1]
+            abs_mag = jnp.interp(jax.random.uniform(key_mag, shape), cdf, self._M_q)
+        else:
+            abs_mag = jax.random.uniform(
+                key_mag, shape, minval=self._abs_mag_min, maxval=self._abs_mag_max
+            )
         pred_color = self._color_spl(abs_mag) + self.color_offset
         color = pred_color + self.color_scale * jax.random.normal(key_color, shape)
 

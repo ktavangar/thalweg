@@ -1,8 +1,9 @@
-__all__ = ["ModelMixin", "ModelComponent", "ComponentMixtureModel"]
+__all__ = ["ModelMixin", "ModelComponent", "ComponentMixtureModel", "FromDist"]
 
 import copy
 from abc import abstractmethod
-from collections import defaultdict
+from collections.abc import Mapping
+from dataclasses import dataclass
 from itertools import chain
 from typing import Any
 
@@ -17,11 +18,132 @@ from jax.typing import ArrayLike
 from jax_ext.integrate import ln_simpson
 from numpyro.handlers import seed
 
-from stream_membership.distributions import ConcatenatedDistributions
-
 from ._typing import CoordinateName
+from .distributions.gmm import IndependentGMM
 from .plot import _plot_projections
 from .utils import get_coord_from_data_dict
+
+
+@dataclass(frozen=True)
+class FromDist:
+    """A marker for use as a value in ``coord_parameters[coord][arg]``.
+
+    Instead of being sampled fresh (like a raw value, a `dist.Distribution`,
+    or a `numpyro.sample(**val)` dict would be), this tells `make_dists` to
+    reuse the *already-constructed* distribution object for another
+    coordinate of the same component, built earlier in the same
+    `make_dists()` call.
+
+    This is intra-component, cross-coordinate parameter sharing -- e.g. a
+    "pm1|phi1" conditional coordinate reusing the exact sampled mixture
+    weights/locs/scales of a "phi1" marginal coordinate's distribution
+    object, rather than resampling an independent copy of them. (This is
+    different from `ComponentMixtureModel`'s `tied_coordinates`, which
+    shares a whole coordinate's distribution *across components*.)
+
+    Parameters
+    ----------
+    coord_name
+        The name of the sibling coordinate to pull the distribution object
+        from. That coordinate must appear *earlier* than the coordinate
+        using this marker in `coord_distributions` (dict insertion order
+        controls the build order in `make_dists`), or a `KeyError` is
+        raised.
+    """
+
+    coord_name: CoordinateName
+
+
+def _extract_coord_marginal(
+    dist_obj: dist.Distribution, container_key: CoordinateName, target_name: str
+) -> dist.Distribution:
+    """Pull `target_name`'s own exact marginal distribution out of `dist_obj`.
+
+    Used by `ComponentMixtureModel._coord_eval_units` when sibling
+    components disagree on how a coordinate is grouped -- e.g. offtrack
+    represents ("phi1","phi2") as a single joint `IndependentGMM`, while
+    bkg/stream instead have separate "phi1"/"phi2" distributions. In that
+    case, offtrack's contribution to the (decomposed, per-coordinate)
+    "phi1" evaluation unit must be *just* the phi1-axis marginal of its
+    joint (phi1,phi2) distribution, not the whole joint object.
+
+    If `container_key == target_name` (a plain string key), `dist_obj`
+    already *is* that coordinate's own distribution, so it's returned
+    unchanged -- no decomposition needed.
+
+    Otherwise `container_key` must be a tuple containing `target_name`, and
+    `dist_obj` must implement `.marginal(axis)` (currently only
+    `IndependentGMM` does) returning the exact analytical marginal along
+    that axis -- this is mathematically exact (not an approximation)
+    because `IndependentGMM`'s components have no cross-axis covariance.
+    """
+    if container_key == target_name:
+        return dist_obj
+
+    if not isinstance(container_key, tuple) or target_name not in container_key:
+        msg = (
+            f"Coordinate {target_name!r} not found in container key "
+            f"{container_key!r}."
+        )
+        raise ValueError(msg)
+
+    if not hasattr(dist_obj, "marginal"):
+        msg = (
+            f"A sibling component represents {target_name!r} as its own "
+            f"coordinate, but this component only has it bundled into the "
+            f"joint distribution for {container_key!r} (type "
+            f"{type(dist_obj).__name__}), which does not implement "
+            f"`.marginal(axis)` to extract {target_name!r}'s own exact "
+            f"marginal. Either give this component its own separate "
+            f"{target_name!r} coordinate, or implement `.marginal()` on "
+            f"{type(dist_obj).__name__}."
+        )
+        raise TypeError(msg)
+
+    axis = container_key.index(target_name)
+    return dist_obj.marginal(axis)
+
+
+def _harmonize_event_shapes(
+    dists_by_component: dict[str, dist.Distribution],
+) -> dict[str, dist.Distribution]:
+    """Make every component's distribution for one decomposed coordinate agree.
+
+    `dist.MixtureGeneral` (used in `ComponentMixtureModel.__call__` to
+    combine one coordinate's per-component distributions) requires every
+    component distribution to share the exact same `event_shape` (in
+    addition to the same `.support` type, already handled by
+    `IndependentGMM.support`'s D=1 special-case). A decomposed coordinate
+    (see `_coord_eval_units`) can end up with a mix of:
+
+    - D=1 `IndependentGMM`s, `event_shape=(1,)` -- either a component's own
+      literal distribution for this coordinate (e.g. bkg/stream's own
+      "phi1"), or one produced by `_extract_coord_marginal`'s
+      `.marginal(axis)` call on a sibling's joint distribution.
+    - Plain scalar distributions, `event_shape=()` -- e.g. a component's own
+      `dist.TruncatedNormal` or `TruncatedNormalGMMConditional` for this
+      coordinate (which deliberately mimics `TruncatedNormal`'s support
+      type, but is still scalar-event).
+
+    If *every* component's distribution for this coordinate is a D=1
+    `IndependentGMM`, they already agree (all `event_shape=(1,)`) and
+    nothing needs to change -- this is the existing, already-working case
+    (e.g. "phi1" decomposed only because a sibling groups it into a joint
+    tuple, while every component's *own* phi1 representation is still an
+    `IndependentGMM`). Otherwise, every `IndependentGMM` among them is
+    converted to its scalar-event equivalent
+    (`IndependentGMM.to_scalar_mixture`) so all components agree on plain
+    scalar semantics.
+    """
+    if all(isinstance(d, IndependentGMM) for d in dists_by_component.values()):
+        return dists_by_component
+
+    return {
+        component_name: (
+            d.to_scalar_mixture() if isinstance(d, IndependentGMM) else d
+        )
+        for component_name, d in dists_by_component.items()
+    }
 
 
 class ModelMixin:
@@ -103,6 +225,16 @@ class ModelMixin:
             Whether to add labels to the axes.
         pcolormesh_kwargs
             Keyword arguments to pass to the matplotlib.pcolormesh() function.
+        ndata
+            Either a single scalar (used to scale every coordinate pair's model
+            density into expected counts), or a dict to look up a per-pair/per-
+            coordinate scalar from -- keyed either by the full `name_pair` tuple
+            (e.g. `("phi1", "pm1")`) or by just the non-x coordinate name (e.g.
+            `"pm1"`). A dict is required when calling this with multiple
+            `grid_coord_names` at once and the coordinates don't all have the
+            same number of valid stars (e.g. under a "ragged" per-coordinate
+            `data` dict, where some coordinates have fewer valid measurements
+            than others).
         """
         grids, ln_ps = self.evaluate_on_2d_grids(
             pars=pars,
@@ -111,7 +243,7 @@ class ModelMixin:
             x_coord_name=x_coord_name,
         )
 
-        if ndata == None:
+        if ndata is None:
             ims = {k: np.exp(v) for k, v in ln_ps.items()}
 
         else:
@@ -121,8 +253,24 @@ class ModelMixin:
                 for k, (grid1, grid2) in grids.items()
             }
 
+            def _ndata_for(name_pair):
+                if not isinstance(ndata, Mapping):
+                    return ndata
+                if name_pair in ndata:
+                    return ndata[name_pair]
+                if name_pair[1] in ndata:
+                    return ndata[name_pair[1]]
+                msg = (
+                    f"No ndata entry found for coordinate pair {name_pair!r} (or "
+                    f"its non-x coordinate {name_pair[1]!r}). Pass either a single "
+                    "scalar ndata to use for every pair, or a dict keyed by the "
+                    "pair or by the non-x coordinate name."
+                )
+                raise KeyError(msg)
+
             ln_ns = {
-                k: ln_p + np.log(ndata) + np.log(bin_area[k]) for k, ln_p in ln_ps.items()
+                k: ln_p + np.log(_ndata_for(k)) + np.log(bin_area[k])
+                for k, ln_p in ln_ps.items()
             }
             ims = {k: np.exp(v) for k, v in ln_ns.items()}
 
@@ -145,6 +293,7 @@ class ModelMixin:
         label: bool = True,
         pcolormesh_kwargs: dict | None = None,
         smooth: int | float | None = 1.0,
+        x_data: dict[str, Any] | None = None,
     ):
         """
         Plot the residuals of the model evaluated on 2D grids compared to the input
@@ -154,7 +303,10 @@ class ModelMixin:
         ----------
         data
             A dictionary of data arrays, where the keys are the names of the coordinates
-            in the model component.
+            in the model component. Coordinates are allowed to be "ragged" (i.e. not
+            all the same length) -- for example, if some stars are missing a
+            radial_velocity measurement and were dropped for that coordinate rather
+            than sentinel-filled.
         pars
             A dictionary of parameter values for the model component.
         grids
@@ -181,6 +333,17 @@ class ModelMixin:
         smooth
             The standard deviation of the Gaussian kernel to use for smoothing the
             residuals. If None, no smoothing is applied.
+        x_data
+            Optional per-coordinate override for the x-axis array used both for
+            binning the data histogram and for normalizing the model counts (the
+            "N_data" used to convert the model's probability density into expected
+            counts). Callers with "ragged" `data` (see above) should pass a dict
+            mapping each non-x coordinate name -> the x-array that is actually
+            aligned, element-for-element, with `data[coord_name]` (e.g. that
+            coordinate's own valid-star phi1 subsample). If a coordinate is missing
+            from `x_data` (or `x_data` is None), this falls back to `data[x_name]`
+            directly, which is only correct when every coordinate's array shares a
+            common length/ordering.
 
         """
         from scipy.ndimage import gaussian_filter
@@ -191,7 +354,6 @@ class ModelMixin:
             grid_coord_names=grid_coord_names,
             x_coord_name=x_coord_name,
         )
-        N_data = next(iter(data.values())).shape[0]
 
         # Compute the bin area for each 2D grid cell for a cheap integral...
         bin_area = {
@@ -199,18 +361,30 @@ class ModelMixin:
             for k, (grid1, grid2) in grids_2d.items()
         }
 
-        ln_ns = {
-            k: ln_p + np.log(N_data) + np.log(bin_area[k]) for k, ln_p in ln_ps.items()
-        }
-        model_ims = {k: np.exp(v) for k, v in ln_ns.items()}
-
         resid_ims = {}
-        for name_pair, model_im in model_ims.items():
+        resid = None  # kept as the last pair's *pre-smoothing* residual, matching
+        # the original (pre-ragged) implementation's percentile-based vmin/vmax
+        for name_pair, ln_p in ln_ps.items():
+            x_vals = (
+                x_data[name_pair[1]]
+                if x_data is not None and name_pair[1] in x_data
+                else data[name_pair[0]]
+            )
+            y_vals = data[name_pair[1]]
+
+            # Each coordinate pair gets its own N_data (rather than one shared
+            # N_data for every pair) since, under a ragged `data` dict, different
+            # coordinates can have different numbers of valid stars.
+            N_data = len(y_vals)
+
+            ln_n = ln_p + np.log(N_data) + np.log(bin_area[name_pair])
+            model_im = np.exp(ln_n)
+
             # get the number density: density=True is the prob density, so need to
             # multiply back in the total number of data points
             H_data, *_ = np.histogram2d(
-                data[name_pair[0]],
-                data[name_pair[1]],
+                x_vals,
+                y_vals,
                 bins=(grids[name_pair[0]], grids[name_pair[1]]),
             )
             data_im = H_data.T
@@ -534,7 +708,24 @@ class ModelComponent(eqx.Module, ModelMixin):
                 else:
                     wrapper = lambda x: x  # noqa: E731
 
-                if arg in pars.get(coord_name, {}):
+                if isinstance(val, FromDist):
+                    # Reuse an already-built sibling coordinate's distribution
+                    # object (see `FromDist`'s docstring) instead of sampling
+                    # anything -- this never creates a numpyro sample site, so
+                    # `val.coord_name` must have already been built earlier in
+                    # this same `make_dists()` call (i.e. it must come earlier
+                    # in `coord_distributions`' insertion order).
+                    if val.coord_name not in dists:
+                        msg = (
+                            f"Coordinate {coord_name!r} references "
+                            f"{val.coord_name!r} via FromDist, but "
+                            f"{val.coord_name!r} hasn't been built yet in this "
+                            "make_dists() call -- it must appear earlier than "
+                            f"{coord_name!r} in coord_distributions."
+                        )
+                        raise KeyError(msg)
+                    par = dists[val.coord_name]
+                elif arg in pars.get(coord_name, {}):
                     # If an argument is passed in the pars dictionary, use that value.
                     # This is useful, for example, for constructing the coordinate
                     # distributions once a model is optimized or sampled, so you can
@@ -623,9 +814,29 @@ class ModelComponent(eqx.Module, ModelMixin):
                     f"{numpyro_name}:modeldata", dist_, sample_shape=sample_shape
                 )
 
-                with numpyro.plate('data', _data.shape[0]):
-                    numpyro.sample(f"{numpyro_name}-obs",dist.Normal(model_val, _data_err),obs=_data,
-            )
+                # NOTE: the plate name must be unique per coordinate (not a
+                # shared literal "data"), because this loop can execute the
+                # `with numpyro.plate(...)` block multiple times per model
+                # call -- once for each ragged coordinate that has an error
+                # term (e.g. pm1, pm2, radial_velocity), each with its own,
+                # generally different, N. Reusing the same plate name across
+                # those separate blocks causes numpyro's `initialize_model`/
+                # `AutoNormal._setup_prototype` machinery to broadcast a
+                # later coordinate's `obs=_data` against an earlier
+                # coordinate's (differently-sized) plate frame, raising
+                # `ValueError: Incompatible shapes for broadcasting`. This
+                # was verified with a minimal repro: two ragged coordinates
+                # (sizes 100 and 50) sharing a plate named "data" reproduce
+                # exactly this error in `svi.init`; giving each coordinate
+                # its own plate name (matching the
+                # `f"data-{numpyro_name}"` convention already used in
+                # `ComponentMixtureModel.__call__` below) fixes it.
+                with numpyro.plate(f"data-{numpyro_name}", _data.shape[0]):
+                    numpyro.sample(
+                        f"{numpyro_name}-obs",
+                        dist.Normal(model_val, _data_err),
+                        obs=_data,
+                    )
             else:
                 numpyro.sample(f"{numpyro_name}-obs", dist_, obs=_data)
 
@@ -736,6 +947,33 @@ class ModelComponent(eqx.Module, ModelMixin):
                     msg = f"{name} is not a valid coordinate name"
                     raise ValueError(msg)
 
+        # First we have to check if the model component for the x coordinate is in a
+        # joint distribution with another coordinate. If it is, we need to evaluate the
+        # joint distribution on the grid and compute the marginal distribution for x --
+        # which requires that joint pair's own 2D grid below, *regardless* of whether
+        # the caller's `grid_coord_names` happens to include it. For example, calling
+        # this with `grid_coord_names=[("phi1", "pm1")]` on a component where "phi1" is
+        # only defined jointly as ("phi1", "phi2") (e.g. the offtrack component's
+        # spatial term) still needs the ("phi1", "phi2") grid to compute the phi1
+        # marginal.
+        x_joint_name_pair = None
+        if x_coord_name not in self.coord_distributions:
+            # At this point, x_coord_name is definitely a valid coord name, but it
+            # doesn't exist as a string key in coord_distributions - it must be in a
+            # joint:
+            for x_joint_name_pair in self.coord_distributions:
+                if x_coord_name in x_joint_name_pair:
+                    break
+
+        # NOTE: `grids_2d` (below) is returned to the caller and is what downstream
+        # plotting code (`plot.py::_plot_projections`, via `plot_model_projections`)
+        # iterates over via `list(grids.keys())` to decide what to actually plot -- so
+        # it must contain *only* the caller's originally-requested `grid_coord_names`,
+        # never the extra `x_joint_name_pair` grid computed just above for internal use.
+        # Merging it in here caused an `IndexError` in `_plot_projections` (an extra,
+        # unrequested pair showed up in `grids.keys()`, and it tried to index a
+        # single-Axes `axes` object at position 1). So we build that pair's grid
+        # separately, below, rather than folding it into `grids_2d`.
         grids_2d = self._get_grids_2d(grids, grid_coord_names)
 
         # Extra data to pass to log_prob() for each coordinate:
@@ -745,21 +983,19 @@ class ModelComponent(eqx.Module, ModelMixin):
         # Make the distributions for each coordinate:
         dists = self.make_dists(pars=pars, dists=dists)
 
-        # First we have to check if the model component for the x coordinate is in a
-        # joint distribution with another coordinate. If it is, we need to evaluate the
-        # joint distribution on the grid and compute the marginal distribution for x:
-        if x_coord_name not in self.coord_distributions:
-            # At this point, x_coord_name is definitely a valid coord name, but it
-            # doesn't exist as a string key in coord_distributions - it must be in a
-            # joint:
-            for x_joint_name_pair in self.coord_distributions:
-                if x_coord_name in x_joint_name_pair:
-                    break
-
-            # Evaluate the joint distribution on the grids:
-            grid1, grid2 = grids_2d[x_joint_name_pair]
-            grid1_c = 0.5 * (grid1[:-1, :-1] + grid1[1:, 1:])
-            grid2_c = 0.5 * (grid2[:-1, :-1] + grid2[1:, 1:])
+        if x_joint_name_pair is not None:
+            # Evaluate the joint distribution on the grids -- reuse the grid already
+            # in `grids_2d` if the caller happened to request this exact pair too,
+            # otherwise compute it separately (see NOTE above for why this must not
+            # be merged into the returned `grids_2d` dict).
+            if x_joint_name_pair in grids_2d:
+                x_joint_grid1, x_joint_grid2 = grids_2d[x_joint_name_pair]
+            else:
+                ((x_joint_grid1, x_joint_grid2),) = self._get_grids_2d(
+                    grids, [x_joint_name_pair]
+                ).values()
+            grid1_c = 0.5 * (x_joint_grid1[:-1, :-1] + x_joint_grid1[1:, 1:])
+            grid2_c = 0.5 * (x_joint_grid2[:-1, :-1] + x_joint_grid2[1:, 1:])
 
             ln_p = dists[x_joint_name_pair].log_prob(
                 jnp.stack((grid1_c, grid2_c), axis=-1),
@@ -819,8 +1055,12 @@ class ComponentMixtureModel(eqx.Module, ModelMixin):
     Creating a mixture model from multiple ModelComponent objects.
 
     :param mixing_probs:
-        the distribution of the mixing probabilities for the components in the mixture model
-    :type mixing_probs: dist.Dirichlet | ArrayLike
+        the distribution of the mixing probabilities for the components in the mixture model.
+        Can be any numpyro ``Distribution`` with ``event_shape == (n_components,)`` and
+        ``support == constraints.simplex`` (e.g. ``dist.Dirichlet``, or a
+        ``dist.TransformedDistribution`` built from ``StickBreakingTransform``), or a plain
+        fixed array of shape ``(n_components,)``.
+    :type mixing_probs: dist.Distribution | ArrayLike
 
     :param components:
         a list of the model components that make up the mixture model
@@ -852,7 +1092,7 @@ class ComponentMixtureModel(eqx.Module, ModelMixin):
         This is just a restructuring of the input list of components into a dictionary for easier access.
     :type _components: dict[str, ModelComponent]
     """
-    mixing_probs: dist.Dirichlet | ArrayLike
+    mixing_probs: dist.Distribution | ArrayLike
     components: list[ModelComponent]
     tied_coordinates: dict[str, dict[str, str]] = eqx.field(default=None)
 
@@ -884,7 +1124,7 @@ class ComponentMixtureModel(eqx.Module, ModelMixin):
 
         mix_shape = (
             self.mixing_probs.event_shape[0]
-            if isinstance(self.mixing_probs, dist.Dirichlet)
+            if isinstance(self.mixing_probs, dist.Distribution)
             else self.mixing_probs.shape[0]
         )
 
@@ -899,8 +1139,9 @@ class ComponentMixtureModel(eqx.Module, ModelMixin):
         self.tied_coordinates = (
             self.tied_coordinates if self.tied_coordinates is not None else {}
         )
-        # TODO: out of laziness, we only support non-joint coordinates in tied
-        # coordinates for now...
+        # Tied coordinates may be plain names ("pm1") or joint coordinates given
+        # as a tuple of names (e.g. ("PS_g", "PS_r")), matching the keys of
+        # the components' `coord_distributions`.
         for component_name, coords in self.tied_coordinates.items():
             if component_name not in self._components:
                 msg = (
@@ -910,9 +1151,16 @@ class ComponentMixtureModel(eqx.Module, ModelMixin):
                 raise ValueError(msg)
 
             for coord_name in coords:
-                if not isinstance(coord_name, str):
-                    msg = "Only non-joint coordinates are supported in tied coordinates"
-                    raise NotImplementedError(msg)
+                is_name = isinstance(coord_name, str)
+                is_joint = isinstance(coord_name, tuple) and all(
+                    isinstance(c, str) for c in coord_name
+                )
+                if not (is_name or is_joint):
+                    msg = (
+                        "Tied coordinates must be a coordinate name or a tuple of "
+                        "coordinate names (joint coordinate)"
+                    )
+                    raise TypeError(msg)
 
         # Check for circular dependencies and set up order of components to create dists
         # for:
@@ -963,40 +1211,117 @@ class ComponentMixtureModel(eqx.Module, ModelMixin):
 
         return tied_order
 
-    def _make_concatenated(self) -> dict[str, Any]:
+    def _make_component_dists(
+        self,
+    ) -> dict[str, dict[CoordinateName, dist.Distribution]]:
+        """Build the per-coordinate distributions for every component.
+
+        Unlike the old `_make_concatenated`, this does *not* glue each
+        component's per-coordinate distributions together into a single
+        joint `ConcatenatedDistributions` object -- it just returns the
+        per-coordinate distributions directly, keyed by component name and
+        then by coordinate name (preserving tuple keys for joint
+        coordinates, e.g. `CMD_COORD`). This is what lets `__call__` below
+        build one `MixtureGeneral` *per coordinate*, each with its own
+        independently-sized `numpyro.plate`, instead of one plate shared
+        across every coordinate.
+        """
         # Deal with tied coordinates here across components:
-        concatenated: dict[str, ConcatenatedDistributions] = {}
-
-        # TODO: figure out batch shape and event shape based on all components, and pass
-        # that in to the ConcatenatedDistributions so that all concatenated have the
-        # same shape expectations!
-
-        all_dists: dict[str, dict[str, dist.Distribution]] = defaultdict(dict)
+        all_dists: dict[str, dict[CoordinateName, dist.Distribution]] = {}
         for component_name in self._tied_order:
             component = self._components[component_name]
             tied_map = self.tied_coordinates.get(component_name, {})
 
-            # TODO: ._dists is a list now, so this won't work...
             override_dists = {
                 override_coord: all_dists[dep][override_coord]
                 for override_coord, dep in tied_map.items()
             }
 
             ## Having forced the offtrack proper motions (for example) to be identical
-            ##  to the stream proper motions, make_dists will create the distributions 
+            ##  to the stream proper motions, make_dists will create the distributions
             ##  including numpyro.sample. This should be equivalent to creating an if
-            ##  statement where for tied coordinates (or fixed coordinates), 
+            ##  statement where for tied coordinates (or fixed coordinates),
             ##  we can get the numpyro_name here and do numpyro.deterministic for that parameter.
             ##  This adds the flexibility of being able to have "loosely tied" coordinates
             ##  i.e. where the tied coordinates are not identical, but are related in some way.
 
-            dists = component.make_dists(dists=override_dists)
-            concatenated[component_name] = ConcatenatedDistributions(
-                dists=list(dists.values())
-            )
-            all_dists[component_name] = dists
+            all_dists[component_name] = component.make_dists(dists=override_dists)
 
-        return concatenated
+        return all_dists
+
+    def _coord_eval_units(
+        self, all_dists: dict[str, dict[CoordinateName, dist.Distribution]]
+    ) -> list[tuple[CoordinateName, dict[str, dist.Distribution]]]:
+        """Group `all_dists` into per-likelihood-term evaluation units.
+
+        Returns a list of `(coord_key, {component_name: dist})` pairs, one
+        per coordinate (or joint group of coordinates) to be evaluated as its
+        own `MixtureGeneral` + `numpyro.plate` in `__call__`.
+
+        Each component's own `coord_distributions` may group coordinate
+        names into joint/tuple keys differently from its siblings (e.g.
+        offtrack's spatial term may be a single joint `("phi1","phi2")`
+        `IndependentGMM` grid while bkg/stream instead use separate,
+        string-keyed "phi1"/"phi2" coordinates) -- `__post_init__` only
+        requires the *flattened* coordinate names to match across
+        components, not this grouping. So: a group of names is evaluated
+        jointly only when every component represents it with the exact same
+        key (preserving existing behavior for e.g. CMD_COORD); otherwise the
+        group is decomposed down to individual coordinate names, and any
+        component that only has a given name as part of a larger joint
+        distribution contributes its exact axis-marginal instead (see
+        `_extract_coord_marginal`).
+        """
+        eval_units: list[tuple[CoordinateName, dict[str, dist.Distribution]]] = []
+        seen_names: set[str] = set()
+
+        for name in self.coord_names:
+            if name in seen_names:
+                continue
+
+            # For each component, find the literal key (string or tuple) in
+            # its own `all_dists[component_name]` that contains `name`.
+            containing_keys: dict[str, CoordinateName] = {}
+            for component_name in self.component_names:
+                for key in all_dists[component_name]:
+                    key_names = key if isinstance(key, tuple) else (key,)
+                    if name in key_names:
+                        containing_keys[component_name] = key
+                        break
+
+            unique_keys = set(containing_keys.values())
+            if len(unique_keys) == 1:
+                # Every component agrees on the same (possibly joint) key:
+                # evaluate it jointly, exactly as before.
+                joint_key = unique_keys.pop()
+                joint_names = (
+                    joint_key if isinstance(joint_key, tuple) else (joint_key,)
+                )
+                seen_names.update(joint_names)
+                eval_units.append(
+                    (
+                        joint_key,
+                        {
+                            component_name: all_dists[component_name][joint_key]
+                            for component_name in self.component_names
+                        },
+                    )
+                )
+            else:
+                # Components disagree on how `name` is grouped: decompose
+                # down to this single coordinate, extracting an exact
+                # axis-marginal from any component that only has it bundled
+                # into a larger joint distribution.
+                seen_names.add(name)
+                per_component = {
+                    component_name: _extract_coord_marginal(
+                        all_dists[component_name][key], key, name
+                    )
+                    for component_name, key in containing_keys.items()
+                }
+                eval_units.append((name, _harmonize_event_shapes(per_component)))
+
+        return eval_units
 
     def __getitem__(self, key: str) -> ModelComponent:
         return self._components[key]
@@ -1006,51 +1331,99 @@ class ComponentMixtureModel(eqx.Module, ModelMixin):
     ) -> None:
         """
         This sets up the mixture model in numpyro.
+
+        Each coordinate is modeled in its own `numpyro.plate`, sized
+        independently based on however many stars have data for that
+        coordinate. This means callers no longer need to fabricate a
+        placeholder value plus a huge error (e.g. `radial_velocity=0`,
+        `radial_velocity_err=1e4`) for stars missing a given coordinate --
+        a coordinate can simply be omitted (or restricted to a smaller
+        subsample) in `data`/`err`, and the log-likelihood contribution for
+        that coordinate is only ever computed over the stars that actually
+        have it.
+
+        `mixing_probs` is still sampled exactly once, and the resulting
+        `probs` are reused to build the per-coordinate `MixtureGeneral`s --
+        the membership probabilities have to stay shared and self-
+        consistent across coordinates, even though each coordinate's
+        likelihood plate can have a different size.
+
+        Parameters
+        ----------
+        data
+            A dictionary mapping coordinate name -> array of observed
+            values for that coordinate. A coordinate may be omitted
+            entirely if no stars have data for it; when present, the
+            array only needs to cover the stars that actually have valid
+            data for that coordinate (it no longer needs to match the
+            length of every other coordinate's array).
+        err
+            A dictionary mapping coordinate name -> array of measurement
+            errors, aligned with the corresponding array in `data`. A
+            coordinate present in `data` but missing from `err` (or missing
+            entirely when `err=None`) is treated as being observed exactly,
+            i.e. its likelihood is evaluated directly against the mixture
+            density with no added per-star Gaussian error convolution.
         """
         probs = numpyro.sample("mixture-probs", self.mixing_probs)
+        categorical = dist.Categorical(probs)
 
-        concatenated = self._make_concatenated()
+        all_dists = self._make_component_dists()
 
-        # Here we make sure the order we pass in the components respects the original
-        # order the user passed in, for interpretation of the probabilities:
-        mixture = dist.MixtureGeneral(
-            dist.Categorical(probs),
-            [concatenated[name] for name in self.component_names],
-        )
+        # `__post_init__` only validates that every component's *flattened*
+        # coordinate names match (see `ModelComponent._coord_names`) -- it
+        # does not require every component to group those names into
+        # `all_dists[name]` the same way. E.g. offtrack's spatial term may be
+        # a single joint `("phi1","phi2")` `IndependentGMM` grid while
+        # bkg/stream instead keep separate, string-keyed "phi1"/"phi2"
+        # coordinates. `_coord_eval_units` resolves this: coordinate groups
+        # that every component represents identically (e.g. CMD_COORD, when
+        # present) are still evaluated jointly (unchanged, existing
+        # behavior); groups where components disagree are decomposed down to
+        # individual coordinate names, pulling the exact axis-marginal out of
+        # whichever component(s) only have it as part of a larger joint
+        # distribution (see `_extract_coord_marginal`).
+        eval_units = self._coord_eval_units(all_dists)
 
-        stacked_data = jnp.stack([data[k] for k in self.coord_names], axis=-1)
-        if err is None:
-            numpyro.sample("mixture", mixture, obs=stacked_data)
-        else:
-            # TODO: this is a hack to make sure we have errors for all coordinates
-            #        Do we need to have errors for all coordinates???
-            # NOTE: we should warn the user that this is happening...
-            # err = {k: err.get(k, jnp.full(stacked_data.shape[0], 1e-8)) for k in data}
-            err = {k: err.get(k, 1e-4) for k in data}
-            sample_shape = (stacked_data.shape[0],) if mixture.batch_shape == () else ()
-            model_data = numpyro.sample("mixture:modeldata", mixture, sample_shape=sample_shape)
+        err = err if err is not None else {}
 
-            # TODO: something weird here. How are joint coordinates handled? coord_names
-            # I think it just the names of the coordinates, not the component names. So
-            # can they ever have size 2, as below? Maybe this isn't then the source of
-            # the issue...
+        for coord_key, component_dists_by_name in eval_units:
+            if isinstance(coord_key, tuple):
+                # Joint (e.g. CMD) coordinate: require every sub-coordinate
+                # to be present for a star to be included.
+                if not all(k in data for k in coord_key):
+                    continue
+                _data = jnp.stack([data[k] for k in coord_key], axis=-1)
+                _data_err = None  # TODO: joint coordinates don't support errors yet
+                numpyro_name = "-".join(coord_key)
+            else:
+                if coord_key not in data:
+                    continue
+                _data = jnp.asarray(data[coord_key])
+                _data_err = err.get(coord_key)
+                numpyro_name = coord_key
 
-            i = 0
-            for name in self.coord_names:
-                # TODO: assumes that joints can only have at most 2 coordinates. This is
-                # probably also implicitly assumed elsewhere, so need to enforce this at
-                # some validation time
-                size = 2 if isinstance(name, tuple) else 1
-                slc = slice(i, i + size)
-                
-                with numpyro.plate('data', stacked_data.shape[0]):
-                    if size == 1:
-                        model_data_dist = dist.Normal(jnp.squeeze(model_data[:, slc]), err[name])
-                        numpyro.sample(f"{name}-obs", model_data_dist, obs=jnp.squeeze(stacked_data[:, slc]))
-                    elif size == 2:
-                        model_data_dist = dist.Normal(model_data[:, slc], err[name])
-                        numpyro.sample(f"{name}-obs", model_data_dist, obs=stacked_data[:, slc])
-                i += size
+            component_dists = [
+                component_dists_by_name[name] for name in self.component_names
+            ]
+            mixture = dist.MixtureGeneral(categorical, component_dists)
+
+            if _data_err is None:
+                with numpyro.plate(f"data-{numpyro_name}", _data.shape[0]):
+                    numpyro.sample(f"{numpyro_name}-obs", mixture, obs=_data)
+            else:
+                sample_shape = (
+                    (_data.shape[0],) if mixture.batch_shape == () else ()
+                )
+                model_val = numpyro.sample(
+                    f"{numpyro_name}:modeldata", mixture, sample_shape=sample_shape
+                )
+                with numpyro.plate(f"data-{numpyro_name}", _data.shape[0]):
+                    numpyro.sample(
+                        f"{numpyro_name}-obs",
+                        dist.Normal(model_val, _data_err),
+                        obs=_data,
+                    )
 
     def pack_params(
         self, pars: dict[str, dict[CoordinateName, dict]]

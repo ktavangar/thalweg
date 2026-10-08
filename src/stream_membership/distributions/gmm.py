@@ -7,6 +7,60 @@ from jax.typing import ArrayLike
 __all__ = ["IndependentGMM"]
 
 
+def _drop_trailing_singleton_axis(x: ArrayLike) -> jax.Array:
+    """Undo the "append a (D, 1)-broadcasting axis" convention.
+
+    `IndependentGMM._low`/`_high` are stored in whatever shape they need for
+    broadcasting against `locs`/`scales`'s (D, K) shape when constructing the
+    component `TruncatedNormal` -- typically (D, 1) (see the note in
+    `component_log_probs`). For checking a `value` of shape (..., D) against
+    them (as `_IndependentGMMSupport` needs to), that trailing, size-1 K-axis
+    must be dropped first so `low`/`high` end up shaped (D,) (or scalar) and
+    broadcast against `value`'s *last* (D) axis instead of reappearing as a
+    spurious leading axis.
+    """
+    x = jnp.asarray(x)
+    if x.ndim >= 1 and x.shape[-1] == 1:
+        return jnp.squeeze(x, axis=-1)
+    return x
+
+
+class _IndependentGMMSupport(dist.constraints.Constraint):
+    """The support of an `IndependentGMM`: per-dimension bounds, reduced over D.
+
+    This can't just be `constraints.independent(constraints.interval(...), 1)`
+    because that requires `value` to already carry an explicit trailing D
+    axis, which -- for the D=1 case this class is exercised with everywhere
+    in this codebase -- it never does (`value` arrives shaped `(N,)`, not
+    `(N, 1)`). Instead this mirrors the same defensive `atleast_2d(value.T).T`
+    normalization `component_log_probs` already does, so `check(value)`
+    always returns a shape matching `value`'s batch axes only (no leftover D
+    axis), regardless of whether that trailing D axis was present or not.
+    """
+
+    event_dim = 1
+
+    def __init__(self, low: ArrayLike, high: ArrayLike):
+        self._low = _drop_trailing_singleton_axis(low)
+        self._high = _drop_trailing_singleton_axis(high)
+        super().__init__()
+
+    def __call__(self, value: ArrayLike) -> jax.Array:
+        value = jnp.atleast_2d(jnp.asarray(value).T).T
+        mask = (value >= self._low) & (value <= self._high)
+        return mask.all(axis=-1)
+
+    def __repr__(self) -> str:
+        return f"IndependentGMMSupport(low={self._low}, high={self._high})"
+
+    def feasible_like(self, prototype: ArrayLike) -> jax.Array:
+        mid = (self._low + self._high) / 2
+        return jnp.broadcast_to(mid, jnp.shape(prototype))
+
+    def tree_flatten(self):
+        return (self._low, self._high), (("_low", "_high"), {})
+
+
 class IndependentGMM(dist.MixtureSameFamily):
     def __init__(
         self,
@@ -54,6 +108,12 @@ class IndependentGMM(dist.MixtureSameFamily):
             )
             raise ValueError(msg)
         self._D, self._K = combined_shape
+
+        # Kept (broadcast to the full (D, K) shape) so `marginal` can slice
+        # out a single axis's own locs/scales later, without having to dig
+        # them back out of `component_distribution`'s internals.
+        self._locs = jnp.broadcast_to(jnp.asarray(locs), combined_shape)
+        self._scales = jnp.broadcast_to(jnp.asarray(scales), combined_shape)
 
         component_kwargs = {"loc": locs, "scale": scales}
         if low is not None:
@@ -107,12 +167,52 @@ class IndependentGMM(dist.MixtureSameFamily):
 
     @property
     def support(self):
-        # TODO: it's possible this is not correct. The component distribution support
-        # may not be a vector interval like it needs to be? Anyways, if we see issues
-        # with using this distribution, audit the support!
-        if self.component_distribution.support is not None:
-            return self.component_distribution.support
-        return dist.constraints.real
+        # NOTE: this used to just forward `self.component_distribution.support`
+        # (the underlying `TruncatedNormal`'s `Interval` constraint), but that
+        # constraint's `low`/`high` are shaped (D, 1) -- broadcastable against
+        # `locs`/`scales`'s (D, K) shape (see the long comment in
+        # `component_log_probs` below) -- which is the wrong shape to check a
+        # `value` against here: this distribution's own `event_shape` is (D,),
+        # with no K axis at all. Checking e.g. a (400,) `value` (D=1) against
+        # a (1, 1)-shaped `low`/`high` broadcasts to (1, 400) instead of the
+        # required (400,) (the two size-1 axes both left-pad against the
+        # missing dims instead of disappearing), which silently corrupts every
+        # downstream shape once `numpyro.validate_args`/`validation_enabled()`
+        # actually calls `support.check(value)` -- e.g. from within
+        # `MixtureGeneral.log_prob`, whose `@validate_sample` decorator masks
+        # `log_prob` with exactly this wrongly-shaped array, turning a
+        # `(400,)` result into a `(1, 400)` one (this is the root cause of the
+        # "Cannot broadcast to shape with fewer dimensions" crash in
+        # `ComponentMixtureModel`). Use `_IndependentGMMSupport` instead,
+        # which normalizes `low`/`high` and `value` the same way
+        # `component_log_probs` does and reduces over the D axis, so
+        # `check(value)` always returns a shape matching `value`'s batch axes
+        # (no leftover D or K axes).
+        #
+        # NOTE: this stays `_IndependentGMMSupport` even for D=1 -- do *not*
+        # special-case D=1 to return a plain `constraints.interval`-family
+        # object to try to type-match sibling `dist.TruncatedNormal`/
+        # `TruncatedNormalGMMConditional` distributions in
+        # `ComponentMixtureModel` (a `dist.MixtureGeneral` there requires
+        # every component to expose the same `.support` *type*, see its
+        # `__init__`). Doing so broke `test_gridgmm` in `test_gmm.py`: that
+        # test (and, more importantly, `_IndependentGMMSupport`'s own
+        # `event_dim=1` contract) calls `.support.check(value)` directly with
+        # an explicit (N, D) `value` and expects a *reduced*, (N,)-shaped
+        # mask back -- which only `_IndependentGMMSupport` provides (a plain
+        # `constraints.interval` has `event_dim=0` and returns an unreduced
+        # (N, D) mask instead). Callers that need a D=1 `IndependentGMM` to
+        # look like a plain scalar (event_shape=(), interval-typed) sibling
+        # distribution -- i.e. `ComponentMixtureModel._coord_eval_units`,
+        # when a coordinate decomposed out of a joint `IndependentGMM` must
+        # combine with such siblings -- should instead call
+        # `to_scalar_mixture()`, which rebuilds an exactly equivalent
+        # distribution out of genuine `dist.TruncatedNormal` components
+        # (whose own native support already has the right type), rather than
+        # relying on this property to change meaning based on D.
+        low = -jnp.inf if self._low is None else self._low
+        high = jnp.inf if self._high is None else self._high
+        return _IndependentGMMSupport(low, high)
 
     def component_log_probs(self, value: ArrayLike) -> jax.Array:
         value = jnp.array(value)
@@ -181,6 +281,94 @@ class IndependentGMM(dist.MixtureSameFamily):
             component_log_probs,
             neg_inf_sentinel,
         )
+
+    def marginal(self, axis: int) -> "IndependentGMM":
+        """The exact 1D marginal `IndependentGMM` along one axis.
+
+        This is mathematically exact -- not an approximation -- because
+        `IndependentGMM`'s components are diagonal (no cross-axis
+        covariance): marginalizing any subset of axes out of a joint
+        `IndependentGMM` gives another `IndependentGMM` over the remaining
+        axis/axes, with the *same* mixing weights (the discrete "which
+        component" latent is untouched by integrating out other axes) and
+        each component's own loc/scale/bounds restricted to that axis.
+
+        Used by `ComponentMixtureModel.__call__` when one component
+        represents a set of coordinates as a single joint `IndependentGMM`
+        (e.g. offtrack's joint `("phi1","phi2")` 2D grid) while a sibling
+        component in the same mixture represents them as separate,
+        string-keyed coordinates (e.g. bkg/stream's separate "phi1"/"phi2")
+        -- each coordinate's own per-component mixture likelihood term still
+        needs a single-axis distribution to combine with its siblings, so
+        the joint component's contribution is this exact marginal instead.
+        """
+        low = None if self._low is None else jnp.asarray(self._low)[axis : axis + 1]
+        high = None if self._high is None else jnp.asarray(self._high)[axis : axis + 1]
+        return IndependentGMM(
+            self.mixing_distribution,
+            locs=self._locs[axis : axis + 1],
+            scales=self._scales[axis : axis + 1],
+            low=low,
+            high=high,
+            validate_args=False,
+        )
+
+    def to_scalar_mixture(self) -> dist.MixtureGeneral:
+        """A scalar-event (`event_shape=()`) distribution equal to this D=1 `IndependentGMM`.
+
+        `IndependentGMM` always has `event_shape=(self._D,)`, so even a D=1
+        instance (e.g. one returned by `marginal(axis)`) has `event_shape=(1,)`,
+        never a bare `()`. `numpyro.distributions.MixtureGeneral` requires
+        every component distribution combined into it to agree exactly on
+        `event_shape` *and* on `.support`'s type (see
+        `ComponentMixtureModel._coord_eval_units`/`_harmonize_event_shapes` in
+        `model.py`, which calls this method when a coordinate decomposed out
+        of a joint `IndependentGMM` needs to be combined with sibling
+        components' plain, scalar-event `dist.TruncatedNormal` or
+        `TruncatedNormalGMMConditional` distributions for that same
+        coordinate).
+
+        This rebuilds an exactly equivalent distribution -- same mixing
+        weights, same per-component loc/scale/bounds -- as a
+        `dist.MixtureGeneral` over `K` individual scalar `dist.TruncatedNormal`
+        components instead, which is genuinely scalar-event and whose
+        `.support` is a plain `constraints.interval`-family constraint (the
+        same type plain `TruncatedNormal` itself exposes), so it can be
+        combined with those siblings.
+
+        Only valid for a D=1 instance -- raises `ValueError` otherwise.
+        """
+        if self._D != 1:
+            msg = (
+                "to_scalar_mixture() only applies to a D=1 IndependentGMM "
+                f"(e.g. one axis of a marginal), but this instance has D={self._D}. "
+                "Call `.marginal(axis)` first to reduce to a single axis."
+            )
+            raise ValueError(msg)
+
+        loc = self._locs[0]  # (K,)
+        scale = self._scales[0]  # (K,)
+        low = (
+            None
+            if self._low is None
+            else _drop_trailing_singleton_axis(jnp.asarray(self._low))
+        )
+        high = (
+            None
+            if self._high is None
+            else _drop_trailing_singleton_axis(jnp.asarray(self._high))
+        )
+        bounds_kwargs = {}
+        if low is not None:
+            bounds_kwargs["low"] = low
+        if high is not None:
+            bounds_kwargs["high"] = high
+
+        component_distributions = [
+            dist.TruncatedNormal(loc=loc[k], scale=scale[k], **bounds_kwargs)
+            for k in range(self._K)
+        ]
+        return dist.MixtureGeneral(self.mixing_distribution, component_distributions)
 
     def log_prob(self, value: ArrayLike) -> jax.Array:
         comp_lp = self.component_log_probs(value)

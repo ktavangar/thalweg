@@ -70,10 +70,26 @@ def plot_data_projections(
     label=True,
     smooth=1.0,
     pcolormesh_kwargs=None,
+    x_data=None,
 ):
     """
     TODO:
     - coord_names should be a list of tuples like [('phi1', 'phi2')]
+
+    Parameters
+    ----------
+    ...
+    x_data : dict[str, array_like] | None
+        Optional per-coordinate override for the x-axis array used when
+        histogramming a `name_pair`. Callers whose `data` dict is "ragged"
+        (i.e. `data[coord_name]` arrays are not all the same length, because
+        rows missing a given coordinate were dropped rather than sentinel-
+        filled) should pass a dict mapping `name_pair[1]` (the non-x
+        coordinate) -> the x-array that is actually aligned, element-for-
+        element, with `data[name_pair[1]]`. If a coordinate is missing from
+        `x_data` (or `x_data` is None), this falls back to the old behavior
+        of using `data[name_pair[0]]` directly, which is only correct when
+        every coordinate's array shares a common length/ordering.
     """
     from scipy.ndimage import gaussian_filter
 
@@ -84,8 +100,13 @@ def plot_data_projections(
     ims = {}
     im_grids = {}
     for name_pair in coord_names:
+        x_vals = (
+            x_data[name_pair[1]]
+            if x_data is not None and name_pair[1] in x_data
+            else data[name_pair[0]]
+        )
         H_data, xe, ye = np.histogram2d(
-            data[name_pair[0]],
+            x_vals,
             data[name_pair[1]],
             bins=(grids[name_pair[0]], grids[name_pair[1]]),
         )
