@@ -104,6 +104,15 @@ def _extract_coord_marginal(
     return dist_obj.marginal(axis)
 
 
+# Whether decomposed D=1 `IndependentGMM`s are converted to the vectorized
+# `ScalarTruncatedNormalGMM` (compile time independent of the number of GMM
+# components K) or the original `dist.MixtureGeneral` of K separate
+# `TruncatedNormal`s (graph size grows with K). Set to False to restore the old
+# behavior, e.g. ``stream_membership.model.VECTORIZED_SCALAR_MIXTURE = False``
+# before building/running the model.
+VECTORIZED_SCALAR_MIXTURE = True
+
+
 def _harmonize_event_shapes(
     dists_by_component: dict[str, dist.Distribution],
 ) -> dict[str, dist.Distribution]:
@@ -140,7 +149,9 @@ def _harmonize_event_shapes(
 
     return {
         component_name: (
-            d.to_scalar_mixture() if isinstance(d, IndependentGMM) else d
+            d.to_scalar_mixture(vectorized=VECTORIZED_SCALAR_MIXTURE)
+            if isinstance(d, IndependentGMM)
+            else d
         )
         for component_name, d in dists_by_component.items()
     }

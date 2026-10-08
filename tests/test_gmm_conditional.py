@@ -570,3 +570,29 @@ def test_offtrack_style_2d_grid_with_independent_kinematics_runs_end_to_end():
     svi_result = svi.run(jax.random.PRNGKey(5), 15, data=data, progress_bar=False)
 
     assert jnp.isfinite(svi_result.losses[-1])
+
+
+def test_to_scalar_mixture_vectorized_matches_loop():
+    """Vectorized and original (loop of K TruncatedNormals) scalar mixtures agree in-bounds."""
+    K = 12
+    locs = jnp.stack([jnp.linspace(-30.0, 5.0, K), jnp.linspace(-3.0, 3.0, K)])
+    w = jax.nn.softmax(jnp.sin(jnp.arange(K, dtype=float)))
+    g = IndependentGMM(
+        dist.Categorical(w), locs=locs, scales=jnp.full((2, K), 2.0),
+        low=jnp.array([-40.0, -5.0])[:, None], high=jnp.array([10.0, 5.0])[:, None],
+    )
+    m = g.marginal(0)
+    loop, vec = m.to_scalar_mixture(vectorized=False), m.to_scalar_mixture()
+    x = jnp.linspace(-39.0, 9.0, 101)
+    assert jnp.allclose(loop.log_prob(x), vec.log_prob(x), atol=1e-8)
+    assert type(loop.support) is type(vec.support)
+    assert vec.event_shape == () and vec.sample(jax.random.PRNGKey(0), (7,)).shape == (7,)
+    grad = lambda v: jax.grad(  # noqa: E731
+        lambda l: jnp.sum(
+            IndependentGMM(dist.Categorical(w), locs=l, scales=jnp.full((2, K), 2.0),
+                           low=jnp.array([-40.0, -5.0])[:, None],
+                           high=jnp.array([10.0, 5.0])[:, None])
+            .marginal(0).to_scalar_mixture(vectorized=v).log_prob(x)))(locs)
+    assert jnp.allclose(grad(False), grad(True), atol=1e-8)
+    # out of bounds: finite, no NaN gradients
+    assert jnp.isfinite(vec.log_prob(jnp.array([-50.0, 20.0]))).all()

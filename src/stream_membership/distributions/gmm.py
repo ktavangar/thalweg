@@ -4,7 +4,7 @@ import numpyro.distributions as dist
 from jax.scipy.special import logsumexp
 from jax.typing import ArrayLike
 
-__all__ = ["IndependentGMM"]
+__all__ = ["IndependentGMM", "ScalarTruncatedNormalGMM"]
 
 
 def _drop_trailing_singleton_axis(x: ArrayLike) -> jax.Array:
@@ -59,6 +59,76 @@ class _IndependentGMMSupport(dist.constraints.Constraint):
 
     def tree_flatten(self):
         return (self._low, self._high), (("_low", "_high"), {})
+
+
+class ScalarTruncatedNormalGMM(dist.Distribution):
+    """Vectorized scalar-event (``event_shape=()``) 1D truncated-Normal mixture.
+
+    Exactly equivalent to ``dist.MixtureGeneral(mixing, [TruncatedNormal(loc[k],
+    scale[k], low, high) for k in range(K)])``, but evaluated with a single
+    vectorized (K-axis) computation. `MixtureGeneral` instead evaluates each of
+    its component distributions' ``log_prob`` separately in a Python loop, so
+    the traced/compiled graph grows linearly with K -- a major compile-time
+    cost for large K (e.g. a fine off-track lattice). Its `.support` is a plain
+    `constraints.interval`, the same type `dist.TruncatedNormal` exposes, so it
+    can be combined with sibling scalar distributions in an outer
+    `dist.MixtureGeneral`.
+    """
+
+    def __init__(self, mixing_distribution, locs, scales, low=None, high=None,
+                 *, validate_args=None):
+        self._mixing_distribution = mixing_distribution
+        self.locs = jnp.asarray(locs)  # (K,)
+        self.scales = jnp.asarray(scales)  # (K,)
+        # Scalar bounds (a size-1 (1,) / (1, 1) array is squeezed to a scalar).
+        self.low = None if low is None else jnp.reshape(jnp.asarray(low), ())
+        self.high = None if high is None else jnp.reshape(jnp.asarray(high), ())
+        super().__init__(batch_shape=(), event_shape=(), validate_args=validate_args)
+
+    @property
+    def mixing_distribution(self):
+        return self._mixing_distribution
+
+    @property
+    def support(self):
+        if self.low is None and self.high is None:
+            return dist.constraints.real
+        low = -jnp.inf if self.low is None else self.low
+        high = jnp.inf if self.high is None else self.high
+        return dist.constraints.interval(low, high)
+
+    def _component(self):
+        kwargs = {}
+        if self.low is not None:
+            kwargs["low"] = self.low
+        if self.high is not None:
+            kwargs["high"] = self.high
+        return dist.TruncatedNormal(self.locs, self.scales, **kwargs)
+
+    def log_prob(self, value):
+        value = jnp.asarray(value)
+        v = value[..., None]  # (..., 1) against K components
+        low = -jnp.inf if self.low is None else jnp.asarray(self.low)
+        high = jnp.inf if self.high is None else jnp.asarray(self.high)
+        # Same clip-then-mask NaN-gradient guard as IndependentGMM.component_log_probs.
+        safe_v = jnp.clip(v, low, high)
+        comp_lp = self._component().log_prob(safe_v)
+        comp_lp = jnp.where(
+            (v >= low) & (v <= high), comp_lp, jnp.asarray(-1e10, dtype=comp_lp.dtype)
+        )
+        return logsumexp(
+            jax.nn.log_softmax(self.mixing_distribution.logits) + comp_lp, axis=-1
+        )
+
+    def sample(self, key, sample_shape=()):
+        key_z, key_x = jax.random.split(key)
+        z = self.mixing_distribution.sample(key_z, sample_shape)
+        kwargs = {}
+        if self.low is not None:
+            kwargs["low"] = self.low
+        if self.high is not None:
+            kwargs["high"] = self.high
+        return dist.TruncatedNormal(self.locs[z], self.scales[z], **kwargs).sample(key_x)
 
 
 class IndependentGMM(dist.MixtureSameFamily):
@@ -313,7 +383,7 @@ class IndependentGMM(dist.MixtureSameFamily):
             validate_args=False,
         )
 
-    def to_scalar_mixture(self) -> dist.MixtureGeneral:
+    def to_scalar_mixture(self, vectorized: bool = True):
         """A scalar-event (`event_shape=()`) distribution equal to this D=1 `IndependentGMM`.
 
         `IndependentGMM` always has `event_shape=(self._D,)`, so even a D=1
@@ -337,6 +407,12 @@ class IndependentGMM(dist.MixtureSameFamily):
         combined with those siblings.
 
         Only valid for a D=1 instance -- raises `ValueError` otherwise.
+
+        With ``vectorized=True`` (default) this returns a
+        `ScalarTruncatedNormalGMM`, which evaluates all K components in one
+        vectorized computation (graph size independent of K). With
+        ``vectorized=False`` it returns the original `dist.MixtureGeneral` of K
+        separate `TruncatedNormal` objects (compile time grows with K).
         """
         if self._D != 1:
             msg = (
@@ -363,6 +439,12 @@ class IndependentGMM(dist.MixtureSameFamily):
             bounds_kwargs["low"] = low
         if high is not None:
             bounds_kwargs["high"] = high
+
+        if vectorized:
+            return ScalarTruncatedNormalGMM(
+                self.mixing_distribution, loc, scale,
+                low=bounds_kwargs.get("low"), high=bounds_kwargs.get("high"),
+            )
 
         component_distributions = [
             dist.TruncatedNormal(loc=loc[k], scale=scale[k], **bounds_kwargs)
