@@ -1,4 +1,5 @@
-# thalweg (formerly known as stream-membership in Tavangar & Price-Whelan (2025))
+# thalweg 
+(formerly known as stream-membership in Tavangar & Price-Whelan (2025))
 
 Modeling stellar stream membership with probabilistic models
 
