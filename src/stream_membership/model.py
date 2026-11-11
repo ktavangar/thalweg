@@ -19,6 +19,7 @@ from jax_ext.integrate import ln_simpson
 from numpyro.handlers import seed
 
 from ._typing import CoordinateName
+from .distributions.convolved import convolved_log_prob
 from .distributions.gmm import IndependentGMM
 from .plot import _plot_projections
 from .utils import get_coord_from_data_dict
@@ -54,107 +55,33 @@ class FromDist:
     coord_name: CoordinateName
 
 
-def _extract_coord_marginal(
-    dist_obj: dist.Distribution, container_key: CoordinateName, target_name: str
-) -> dist.Distribution:
-    """Pull `target_name`'s own exact marginal distribution out of `dist_obj`.
+def _valid_mask_key(name: str) -> str:
+    """Key in ``data`` holding a ragged coordinate's full-length boolean mask.
 
-    Used by `ComponentMixtureModel._coord_eval_units` when sibling
-    components disagree on how a coordinate is grouped -- e.g. offtrack
-    represents ("phi1","phi2") as a single joint `IndependentGMM`, while
-    bkg/stream instead have separate "phi1"/"phi2" distributions. In that
-    case, offtrack's contribution to the (decomposed, per-coordinate)
-    "phi1" evaluation unit must be *just* the phi1-axis marginal of its
-    joint (phi1,phi2) distribution, not the whole joint object.
-
-    If `container_key == target_name` (a plain string key), `dist_obj`
-    already *is* that coordinate's own distribution, so it's returned
-    unchanged -- no decomposition needed.
-
-    Otherwise `container_key` must be a tuple containing `target_name`, and
-    `dist_obj` must implement `.marginal(axis)` (currently only
-    `IndependentGMM` does) returning the exact analytical marginal along
-    that axis -- this is mathematically exact (not an approximation)
-    because `IndependentGMM`'s components have no cross-axis covariance.
+    E.g. ``"pm1" -> "pm1_valid"``. A coordinate whose array is shorter than the
+    full sample (because some stars have no measurement) must come with this
+    mask, which is ``True`` at the positions of the stars that do have it, in
+    the same order as the ragged array.
     """
-    if container_key == target_name:
-        return dist_obj
+    return f"{name}_valid"
 
-    if not isinstance(container_key, tuple) or target_name not in container_key:
+
+def _per_star_log_prob(d: dist.Distribution, value: jax.Array, n: int) -> jax.Array:
+    """``d.log_prob(value)`` as a flat (n,) array, one entry per star.
+
+    Scalar coordinates whose distribution has a length-1 event (e.g. a D=1
+    `IndependentGMM` for "phi1") are given a trailing axis first.
+    """
+    if value.ndim == 1 and len(d.event_shape) == 1 and d.event_shape[0] == 1:
+        value = value[:, None]
+    lp = jnp.asarray(d.log_prob(value))
+    if lp.size != n:
         msg = (
-            f"Coordinate {target_name!r} not found in container key "
-            f"{container_key!r}."
+            f"log_prob returned shape {lp.shape} for {n} stars; expected one "
+            "value per star."
         )
         raise ValueError(msg)
-
-    if not hasattr(dist_obj, "marginal"):
-        msg = (
-            f"A sibling component represents {target_name!r} as its own "
-            f"coordinate, but this component only has it bundled into the "
-            f"joint distribution for {container_key!r} (type "
-            f"{type(dist_obj).__name__}), which does not implement "
-            f"`.marginal(axis)` to extract {target_name!r}'s own exact "
-            f"marginal. Either give this component its own separate "
-            f"{target_name!r} coordinate, or implement `.marginal()` on "
-            f"{type(dist_obj).__name__}."
-        )
-        raise TypeError(msg)
-
-    axis = container_key.index(target_name)
-    return dist_obj.marginal(axis)
-
-
-# Whether decomposed D=1 `IndependentGMM`s are converted to the vectorized
-# `ScalarTruncatedNormalGMM` (compile time independent of the number of GMM
-# components K) or the original `dist.MixtureGeneral` of K separate
-# `TruncatedNormal`s (graph size grows with K). Set to False to restore the old
-# behavior, e.g. ``stream_membership.model.VECTORIZED_SCALAR_MIXTURE = False``
-# before building/running the model.
-VECTORIZED_SCALAR_MIXTURE = True
-
-
-def _harmonize_event_shapes(
-    dists_by_component: dict[str, dist.Distribution],
-) -> dict[str, dist.Distribution]:
-    """Make every component's distribution for one decomposed coordinate agree.
-
-    `dist.MixtureGeneral` (used in `ComponentMixtureModel.__call__` to
-    combine one coordinate's per-component distributions) requires every
-    component distribution to share the exact same `event_shape` (in
-    addition to the same `.support` type, already handled by
-    `IndependentGMM.support`'s D=1 special-case). A decomposed coordinate
-    (see `_coord_eval_units`) can end up with a mix of:
-
-    - D=1 `IndependentGMM`s, `event_shape=(1,)` -- either a component's own
-      literal distribution for this coordinate (e.g. bkg/stream's own
-      "phi1"), or one produced by `_extract_coord_marginal`'s
-      `.marginal(axis)` call on a sibling's joint distribution.
-    - Plain scalar distributions, `event_shape=()` -- e.g. a component's own
-      `dist.TruncatedNormal` or `TruncatedNormalGMMConditional` for this
-      coordinate (which deliberately mimics `TruncatedNormal`'s support
-      type, but is still scalar-event).
-
-    If *every* component's distribution for this coordinate is a D=1
-    `IndependentGMM`, they already agree (all `event_shape=(1,)`) and
-    nothing needs to change -- this is the existing, already-working case
-    (e.g. "phi1" decomposed only because a sibling groups it into a joint
-    tuple, while every component's *own* phi1 representation is still an
-    `IndependentGMM`). Otherwise, every `IndependentGMM` among them is
-    converted to its scalar-event equivalent
-    (`IndependentGMM.to_scalar_mixture`) so all components agree on plain
-    scalar semantics.
-    """
-    if all(isinstance(d, IndependentGMM) for d in dists_by_component.values()):
-        return dists_by_component
-
-    return {
-        component_name: (
-            d.to_scalar_mixture(vectorized=VECTORIZED_SCALAR_MIXTURE)
-            if isinstance(d, IndependentGMM)
-            else d
-        )
-        for component_name, d in dists_by_component.items()
-    }
+    return lp.reshape(n)
 
 
 class ModelMixin:
@@ -820,34 +747,17 @@ class ModelComponent(eqx.Module, ModelMixin):
             
             numpyro_name = self._make_numpyro_name(coord_name)
             if _data_err is not None:
-                sample_shape = (_data.shape[0],) if dist_.batch_shape == () else ()
-                model_val = numpyro.sample(
-                    f"{numpyro_name}:modeldata", dist_, sample_shape=sample_shape
-                )
-
-                # NOTE: the plate name must be unique per coordinate (not a
-                # shared literal "data"), because this loop can execute the
-                # `with numpyro.plate(...)` block multiple times per model
-                # call -- once for each ragged coordinate that has an error
-                # term (e.g. pm1, pm2, radial_velocity), each with its own,
-                # generally different, N. Reusing the same plate name across
-                # those separate blocks causes numpyro's `initialize_model`/
-                # `AutoNormal._setup_prototype` machinery to broadcast a
-                # later coordinate's `obs=_data` against an earlier
-                # coordinate's (differently-sized) plate frame, raising
-                # `ValueError: Incompatible shapes for broadcasting`. This
-                # was verified with a minimal repro: two ragged coordinates
-                # (sizes 100 and 50) sharing a plate named "data" reproduce
-                # exactly this error in `svi.init`; giving each coordinate
-                # its own plate name (matching the
-                # `f"data-{numpyro_name}"` convention already used in
-                # `ComponentMixtureModel.__call__` below) fixes it.
-                with numpyro.plate(f"data-{numpyro_name}", _data.shape[0]):
-                    numpyro.sample(
-                        f"{numpyro_name}-obs",
-                        dist.Normal(model_val, _data_err),
-                        obs=_data,
-                    )
+                # ANALYTIC ERROR CONVOLUTION (replaces the old per-star latents).
+                # Instead of sampling a latent true value per star
+                # ("<component>:<coord>:modeldata") and scoring the observation
+                # with Normal(true, err), the latent is integrated out exactly:
+                # each Gaussian-family density is convolved with N(0, err) (see
+                # stream_membership/distributions/convolved.py). The fitted scale
+                # parameters are still intrinsic (deconvolved) widths. This removes
+                # two guide parameters per star and the sampling noise they add,
+                # so SVI converges in fewer steps and works with 1 particle.
+                lp = convolved_log_prob(dist_, _data, jnp.asarray(_data_err))
+                numpyro.factor(f"{numpyro_name}-obs", jnp.sum(lp))
             else:
                 numpyro.sample(f"{numpyro_name}-obs", dist_, obs=_data)
 
@@ -1260,82 +1170,21 @@ class ComponentMixtureModel(eqx.Module, ModelMixin):
 
         return all_dists
 
-    def _coord_eval_units(
-        self, all_dists: dict[str, dict[CoordinateName, dist.Distribution]]
-    ) -> list[tuple[CoordinateName, dict[str, dist.Distribution]]]:
-        """Group `all_dists` into per-likelihood-term evaluation units.
-
-        Returns a list of `(coord_key, {component_name: dist})` pairs, one
-        per coordinate (or joint group of coordinates) to be evaluated as its
-        own `MixtureGeneral` + `numpyro.plate` in `__call__`.
-
-        Each component's own `coord_distributions` may group coordinate
-        names into joint/tuple keys differently from its siblings (e.g.
-        offtrack's spatial term may be a single joint `("phi1","phi2")`
-        `IndependentGMM` grid while bkg/stream instead use separate,
-        string-keyed "phi1"/"phi2" coordinates) -- `__post_init__` only
-        requires the *flattened* coordinate names to match across
-        components, not this grouping. So: a group of names is evaluated
-        jointly only when every component represents it with the exact same
-        key (preserving existing behavior for e.g. CMD_COORD); otherwise the
-        group is decomposed down to individual coordinate names, and any
-        component that only has a given name as part of a larger joint
-        distribution contributes its exact axis-marginal instead (see
-        `_extract_coord_marginal`).
-        """
-        eval_units: list[tuple[CoordinateName, dict[str, dist.Distribution]]] = []
-        seen_names: set[str] = set()
-
-        for name in self.coord_names:
-            if name in seen_names:
-                continue
-
-            # For each component, find the literal key (string or tuple) in
-            # its own `all_dists[component_name]` that contains `name`.
-            containing_keys: dict[str, CoordinateName] = {}
-            for component_name in self.component_names:
-                for key in all_dists[component_name]:
-                    key_names = key if isinstance(key, tuple) else (key,)
-                    if name in key_names:
-                        containing_keys[component_name] = key
-                        break
-
-            unique_keys = set(containing_keys.values())
-            if len(unique_keys) == 1:
-                # Every component agrees on the same (possibly joint) key:
-                # evaluate it jointly, exactly as before.
-                joint_key = unique_keys.pop()
-                joint_names = (
-                    joint_key if isinstance(joint_key, tuple) else (joint_key,)
-                )
-                seen_names.update(joint_names)
-                eval_units.append(
-                    (
-                        joint_key,
-                        {
-                            component_name: all_dists[component_name][joint_key]
-                            for component_name in self.component_names
-                        },
-                    )
-                )
-            else:
-                # Components disagree on how `name` is grouped: decompose
-                # down to this single coordinate, extracting an exact
-                # axis-marginal from any component that only has it bundled
-                # into a larger joint distribution.
-                seen_names.add(name)
-                per_component = {
-                    component_name: _extract_coord_marginal(
-                        all_dists[component_name][key], key, name
-                    )
-                    for component_name, key in containing_keys.items()
-                }
-                eval_units.append((name, _harmonize_event_shapes(per_component)))
-
-        return eval_units
-
     def __getitem__(self, key: str) -> ModelComponent:
         return self._components[key]
+
+    def _full_size(self, data: dict[str, ArrayLike]) -> int:
+        """Number of stars in the full sample: the length of any coordinate in
+        ``data`` that has no ``<coord>_valid`` mask (i.e. is not ragged)."""
+        for name in self.coord_names:
+            if name in data and _valid_mask_key(name) not in data:
+                return int(jnp.shape(data[name])[0])
+        msg = (
+            "Could not determine the full sample size: every coordinate in "
+            "`data` is ragged. At least one coordinate (e.g. phi1) must be "
+            "present for every star."
+        )
+        raise ValueError(msg)
 
     def __call__(
         self, data: dict[str, ArrayLike], err: dict[str, ArrayLike] | None = None
@@ -1343,98 +1192,118 @@ class ComponentMixtureModel(eqx.Module, ModelMixin):
         """
         This sets up the mixture model in numpyro.
 
-        Each coordinate is modeled in its own `numpyro.plate`, sized
-        independently based on however many stars have data for that
-        coordinate. This means callers no longer need to fabricate a
-        placeholder value plus a huge error (e.g. `radial_velocity=0`,
-        `radial_velocity_err=1e4`) for stars missing a given coordinate --
-        a coordinate can simply be omitted (or restricted to a smaller
-        subsample) in `data`/`err`, and the log-likelihood contribution for
-        that coordinate is only ever computed over the stars that actually
-        have it.
+        The likelihood is a proper per-star mixture: for each star,
 
-        `mixing_probs` is still sampled exactly once, and the resulting
-        `probs` are reused to build the per-coordinate `MixtureGeneral`s --
-        the membership probabilities have to stay shared and self-
-        consistent across coordinates, even though each coordinate's
-        likelihood plate can have a different size.
+            ln L_n = logsumexp_k [ ln pi_k + sum_c ln p_k(x_{n,c}) ]
+
+        where the sum runs over the coordinates that star actually has. Each
+        component evaluates its *own* coordinate keys, so one component can
+        model ("phi1", "phi2") jointly while another models "phi1" and "phi2"
+        separately; no marginalization or regrouping happens.
+
+        Ragged data: a coordinate may be missing from `data` (skipped
+        entirely), or cover only the stars that have it. A ragged
+        coordinate's array must be accompanied by a full-length boolean mask
+        under ``data[f"{coord}_valid"]`` (see `_valid_mask_key`); stars
+        without the coordinate simply get no term for it. Any conditioning
+        arrays (e.g. a spline's ``x``) are baked into the distributions when
+        the components are built, and must already be aligned with each
+        coordinate's own array.
+
+        Measurement errors: for each coordinate in ``err``, every component's
+        density for that coordinate is analytically convolved with the
+        per-star Gaussian error, p_k(x_obs) = int p_k(t) N(x_obs | t, err) dt
+        (exact for the (truncated) Normal families used here; see
+        ``stream_membership.distributions.convolved``). The fitted scales are
+        intrinsic (deconvolved) widths. Joint (tuple) coordinates don't
+        support errors.
 
         Parameters
         ----------
         data
-            A dictionary mapping coordinate name -> array of observed
-            values for that coordinate. A coordinate may be omitted
-            entirely if no stars have data for it; when present, the
-            array only needs to cover the stars that actually have valid
-            data for that coordinate (it no longer needs to match the
-            length of every other coordinate's array).
+            Coordinate name -> observed values, plus ``<coord>_valid`` masks
+            for ragged coordinates.
         err
-            A dictionary mapping coordinate name -> array of measurement
-            errors, aligned with the corresponding array in `data`. A
-            coordinate present in `data` but missing from `err` (or missing
-            entirely when `err=None`) is treated as being observed exactly,
-            i.e. its likelihood is evaluated directly against the mixture
-            density with no added per-star Gaussian error convolution.
+            Coordinate name -> per-star measurement errors, aligned with
+            ``data[coord]``. Coordinates without an entry are treated as
+            exact.
         """
-        probs = numpyro.sample("mixture-probs", self.mixing_probs)
-        categorical = dist.Categorical(probs)
-
-        all_dists = self._make_component_dists()
-
-        # `__post_init__` only validates that every component's *flattened*
-        # coordinate names match (see `ModelComponent._coord_names`) -- it
-        # does not require every component to group those names into
-        # `all_dists[name]` the same way. E.g. offtrack's spatial term may be
-        # a single joint `("phi1","phi2")` `IndependentGMM` grid while
-        # bkg/stream instead keep separate, string-keyed "phi1"/"phi2"
-        # coordinates. `_coord_eval_units` resolves this: coordinate groups
-        # that every component represents identically (e.g. CMD_COORD, when
-        # present) are still evaluated jointly (unchanged, existing
-        # behavior); groups where components disagree are decomposed down to
-        # individual coordinate names, pulling the exact axis-marginal out of
-        # whichever component(s) only have it as part of a larger joint
-        # distribution (see `_extract_coord_marginal`).
-        eval_units = self._coord_eval_units(all_dists)
-
         err = err if err is not None else {}
+        if isinstance(self.mixing_probs, dist.Distribution):
+            probs = numpyro.sample("mixture-probs", self.mixing_probs)
+        else:  # a fixed array of mixing probabilities, as the docstring allows
+            probs = numpyro.deterministic("mixture-probs", jnp.asarray(self.mixing_probs))
+        all_dists = self._make_component_dists()
+        n_full = self._full_size(data)
 
-        for coord_key, component_dists_by_name in eval_units:
-            if isinstance(coord_key, tuple):
-                # Joint (e.g. CMD) coordinate: require every sub-coordinate
-                # to be present for a star to be included.
-                if not all(k in data for k in coord_key):
-                    continue
-                _data = jnp.stack([data[k] for k in coord_key], axis=-1)
-                _data_err = None  # TODO: joint coordinates don't support errors yet
-                numpyro_name = "-".join(coord_key)
-            else:
-                if coord_key not in data:
-                    continue
-                _data = jnp.asarray(data[coord_key])
-                _data_err = err.get(coord_key)
-                numpyro_name = coord_key
-
-            component_dists = [
-                component_dists_by_name[name] for name in self.component_names
-            ]
-            mixture = dist.MixtureGeneral(categorical, component_dists)
-
-            if _data_err is None:
-                with numpyro.plate(f"data-{numpyro_name}", _data.shape[0]):
-                    numpyro.sample(f"{numpyro_name}-obs", mixture, obs=_data)
-            else:
-                sample_shape = (
-                    (_data.shape[0],) if mixture.batch_shape == () else ()
+        # Shared per-coordinate observed values, errors and full-length masks:
+        values: dict[str, jax.Array] = {}
+        masks: dict[str, jax.Array | None] = {}
+        errs: dict[str, jax.Array | None] = {}
+        for name in self.coord_names:
+            if name not in data:
+                continue
+            x = jnp.asarray(data[name])
+            mask = data.get(_valid_mask_key(name))
+            if mask is None and x.shape[0] != n_full:
+                msg = (
+                    f"Coordinate {name!r} has {x.shape[0]} values but the full "
+                    f"sample has {n_full} stars. Pass a full-length boolean mask "
+                    f"as data[{_valid_mask_key(name)!r}] for ragged coordinates."
                 )
-                model_val = numpyro.sample(
-                    f"{numpyro_name}:modeldata", mixture, sample_shape=sample_shape
-                )
-                with numpyro.plate(f"data-{numpyro_name}", _data.shape[0]):
-                    numpyro.sample(
-                        f"{numpyro_name}-obs",
-                        dist.Normal(model_val, _data_err),
-                        obs=_data,
+                raise ValueError(msg)
+            masks[name] = None if mask is None else jnp.asarray(mask, dtype=bool)
+
+            # ANALYTIC ERROR CONVOLUTION: the observed values are used directly,
+            # and coordinates with errors are scored below with each
+            # component's density convolved with N(0, err) (see
+            # stream_membership/distributions/convolved.py). The fitted scales
+            # are intrinsic (deconvolved) widths.
+            values[name] = x
+            e = err.get(name)
+            errs[name] = None if e is None else jnp.asarray(e)
+
+        # Per-component, per-star total log density:
+        component_lps = []
+        for component_name in self.component_names:
+            total = jnp.zeros(n_full)
+            for key, d in all_dists[component_name].items():
+                names = key if isinstance(key, tuple) else (key,)
+                if not all(k in values for k in names):
+                    continue
+                key_masks = [masks[k] for k in names]
+                if len({m is None for m in key_masks}) > 1:
+                    msg = (
+                        f"Joint coordinate {key!r} mixes ragged and full-length "
+                        "coordinates; this isn't supported."
                     )
+                    raise NotImplementedError(msg)
+                # NOTE: ragged sub-coordinates of a joint key are assumed to
+                # share the same valid-star mask; the first one is used.
+                mask = key_masks[0]
+                value = (
+                    jnp.stack([values[k] for k in names], axis=-1)
+                    if isinstance(key, tuple)
+                    else values[key]
+                )
+                key_err = None if isinstance(key, tuple) else errs.get(key)
+                if key_err is None:
+                    lp = _per_star_log_prob(d, value, value.shape[0])
+                else:
+                    # Error-convolved density (replaces scoring a latent value).
+                    lp = jnp.reshape(convolved_log_prob(d, value, key_err), value.shape[0])
+                if mask is None:
+                    total = total + lp
+                else:
+                    idx = jnp.flatnonzero(mask, size=lp.shape[0])
+                    total = total.at[idx].add(lp)
+            component_lps.append(total)
+
+        ln_probs = jnp.log(jnp.asarray(probs))
+        ln_like = jax.scipy.special.logsumexp(
+            jnp.stack(component_lps, axis=0) + ln_probs[:, None], axis=0
+        )
+        numpyro.factor("mixture-ln_like", ln_like.sum())
 
     def pack_params(
         self, pars: dict[str, dict[CoordinateName, dict]]

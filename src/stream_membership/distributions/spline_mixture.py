@@ -215,9 +215,21 @@ class Normal1DSplineMixture(dist.MixtureGeneral):
         self,
         value: ArrayLike,
         x: ArrayLike | None = None,
+        err: ArrayLike | None = None,
     ) -> jax.Array:
         value = jnp.array(value)
         mixing_distribution = self._make_mixing_distribution(x)
+        if err is not None:
+            # Analytic error convolution (replaces the per-star :modeldata
+            # latents): each spline component is convolved with N(0, err)
+            # via its own `log_prob_convolved`, then the log mixing weights
+            # are added, matching what MixtureGeneral.component_log_probs
+            # returns in the err=None branch below.
+            lps = jnp.stack(
+                [c.log_prob_convolved(value, err, x=x) for c in self._make_components(x)],
+                axis=-1,
+            )
+            return jax.nn.log_softmax(mixing_distribution.logits, axis=-1) + lps
         try:
             helper = dist.MixtureSameFamily(
             mixing_distribution, self._make_components(x), validate_args=False
@@ -234,6 +246,16 @@ class Normal1DSplineMixture(dist.MixtureGeneral):
             ) -> jax.Array | Any:
         log_prob = jax.scipy.special.logsumexp(self.component_log_probs(value=value, x=x), axis=-1)
         return log_prob
+
+    def log_prob_convolved(
+        self, value: ArrayLike, err: ArrayLike, x: ArrayLike | None = None
+    ) -> jax.Array:
+        """Log density convolved with per-value Gaussian errors ``err``; the
+        fitted component scales stay intrinsic widths. See
+        ``stream_membership.distributions.convolved``."""
+        return jax.scipy.special.logsumexp(
+            self.component_log_probs(value=value, x=x, err=err), axis=-1
+        )
 
 
 class TruncatedNormal1DSplineMixture(Normal1DSplineMixture):
@@ -328,10 +350,16 @@ class TruncatedNormal1DSplineMixture(Normal1DSplineMixture):
         ]
 
     def component_log_probs(
-        self, value: ArrayLike, x: ArrayLike | None = None
+        self, value: ArrayLike, x: ArrayLike | None = None, err: ArrayLike | None = None
     ) -> jax.Array:
         x = x if x is not None else self.x
         value = jnp.asarray(value)
+
+        if err is not None:
+            # Error-convolved path: the convolved density is non-zero outside
+            # [low, high] (an error can scatter a star across a bound), so the
+            # support mask below must NOT be applied here.
+            return super().component_log_probs(value, x, err=err)
 
         # NOTE: we tried a "clip value into [low, high] before computing
         # component_log_probs" fix here, on the theory that a `value` far

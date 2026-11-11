@@ -1,10 +1,11 @@
-__all__ = ["TruncatedNormalGMMConditional"]
+__all__ = ["PrecomputedAnchors", "TruncatedNormalGMMConditional"]
 
 import jax
 import jax.numpy as jnp
 import numpyro.distributions as dist
 from jax.typing import ArrayLike
 
+from .convolved import log_truncated_normal_convolved
 from .gmm import IndependentGMM
 
 
@@ -17,6 +18,59 @@ def _x_is_joint_value(x: jax.Array, D: int) -> bool:
     `_log_responsibilities`'s docstring for the two supported shapes of `x`.
     """
     return D > 1 and x.ndim >= 1 and x.shape[-1] == D
+
+
+class PrecomputedAnchors:
+    """Precomputed spatial log-densities ``log N_k(x)`` of a FIXED grid.
+
+    When the conditioning `IndependentGMM`'s locs/scales are fixed (only its
+    weights are fitted, e.g. the offtrack grid with ``fixed_scales=True``),
+    ``log N_k(x)`` for a coordinate's own baked-in ``x`` never changes, so
+    computing it once instead of on every SVI step removes several full
+    (N, K) passes from each step. Pass an instance as
+    ``TruncatedNormalGMMConditional(..., anchor_log_probs=...)``; share one
+    instance between coordinates with the same ``x`` (e.g. pm1 and pm2) so
+    XLA can also reuse the per-star normaliser between them.
+
+    The array is computed lazily (eagerly, outside any jit trace) on first
+    use and is NOT pickled, so saved SVI results/guides don't grow by
+    N x K numbers; it is recomputed after unpickling.
+
+    Each row is shifted by its own max over K. Responsibilities only depend
+    on differences within a row, so this changes nothing, but keeps the
+    values O(1) so float32 ``dtype`` is safe.
+    """
+
+    def __init__(self, locs, scales, x, low=None, high=None, dtype=None):
+        self.locs = jnp.asarray(locs)
+        self.scales = jnp.broadcast_to(jnp.asarray(scales), self.locs.shape)
+        self.low = low
+        self.high = high
+        self.x = jnp.asarray(x)
+        self.dtype = dtype
+        self._cache = None
+
+    def get(self) -> jax.Array:
+        if self._cache is None:
+            with jax.ensure_compile_time_eval():
+                K = self.locs.shape[-1]
+                gmm = IndependentGMM(
+                    dist.CategoricalLogits(jnp.zeros(K)),
+                    locs=self.locs, scales=self.scales,
+                    low=self.low, high=self.high, validate_args=False,
+                )
+                x = self.x if self.x.ndim > 1 else self.x[:, None]
+                a = gmm.component_log_probs(x).sum(axis=gmm._dim_dim)  # (N, K)
+                a = a - jnp.max(a, axis=-1, keepdims=True)
+                if self.dtype is not None:
+                    a = a.astype(self.dtype)
+                self._cache = jax.block_until_ready(a)
+        return self._cache
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_cache"] = None
+        return state
 
 
 class TruncatedNormalGMMConditional(dist.Distribution):
@@ -70,6 +124,18 @@ class TruncatedNormalGMMConditional(dist.Distribution):
         pairs) -- see `_log_responsibilities` for how each is handled.
     low, high (optional)
         Truncation bounds for this coordinate's own axis.
+    exact_truncation (optional)
+        See `log_prob_convolved`.
+    anchor_log_probs (optional)
+        A `PrecomputedAnchors` (or an (N, K) array) holding ``log N_k(x)``
+        for this distribution's own ``x``. Only valid when
+        ``conditioning_dist``'s locs/scales are fixed; used whenever no
+        explicit ``x`` is passed to ``log_prob``/``log_prob_convolved``/
+        ``sample``. Rows may be shifted by any per-row constant.
+    compute_dtype (optional)
+        dtype for the (N, K) arithmetic in ``log_prob_convolved`` (e.g.
+        ``jnp.float32``, ~2x faster on CPU for large K). The result is cast
+        back to ``value``'s dtype. Default None: use the inputs' dtype.
     """
 
     def __init__(
@@ -81,6 +147,9 @@ class TruncatedNormalGMMConditional(dist.Distribution):
         low: ArrayLike | None = None,
         high: ArrayLike | None = None,
         *,
+        exact_truncation: bool = False,
+        anchor_log_probs=None,
+        compute_dtype=None,
         validate_args=None,
     ) -> None:
         x = jnp.asarray(x)
@@ -102,6 +171,9 @@ class TruncatedNormalGMMConditional(dist.Distribution):
         self.x = x
         self.low = low
         self.high = high
+        self.exact_truncation = exact_truncation
+        self.anchor_log_probs = anchor_log_probs
+        self.compute_dtype = compute_dtype
 
         self._K = self.loc_vals.shape[-1]
         if self._K != conditioning_dist._K:
@@ -153,8 +225,22 @@ class TruncatedNormalGMMConditional(dist.Distribution):
           dummy placeholder values (0.0) in the other D-1 axes and then
           discarding their (irrelevant) contribution, keeping only axis 0's.
         """
-        x = self.x if x is None else jnp.asarray(x)
+        return jax.nn.log_softmax(self._log_weighted_anchors(x), axis=-1)
+
+    def _anchors(self) -> jax.Array | None:
+        a = self.anchor_log_probs
+        return a.get() if hasattr(a, "get") else a
+
+    def _log_weighted_anchors(self, x: ArrayLike | None = None, dtype=None) -> jax.Array:
+        """log w_k + log N_k(x), shape (..., K) (unnormalised over k)."""
         cd = self.conditioning_dist
+        log_w = jax.nn.log_softmax(cd.mixing_distribution.logits)
+        if x is None and self.anchor_log_probs is not None:
+            anchors = self._anchors()
+            dtype = anchors.dtype if dtype is None else dtype
+            return log_w.astype(dtype) + anchors.astype(dtype)
+
+        x = self.x if x is None else jnp.asarray(x)
         D = cd._D
 
         if D == 1:
@@ -174,8 +260,8 @@ class TruncatedNormalGMMConditional(dist.Distribution):
             full_log_probs = cd.component_log_probs(value)  # (..., D, K)
             anchor_log_probs = jnp.take(full_log_probs, 0, axis=cd._dim_dim)
 
-        log_w = jax.nn.log_softmax(cd.mixing_distribution.logits)
-        return jax.nn.log_softmax(log_w + anchor_log_probs, axis=-1)
+        out = log_w + anchor_log_probs
+        return out if dtype is None else out.astype(dtype)
 
     def _own_component_distribution(self) -> dist.TruncatedNormal:
         return dist.TruncatedNormal(
@@ -207,6 +293,52 @@ class TruncatedNormalGMMConditional(dist.Distribution):
         )  # (..., K)
 
         return jax.scipy.special.logsumexp(log_resp + own_log_probs, axis=-1)
+
+    def log_prob_convolved(
+        self, value: ArrayLike, err: ArrayLike, x: ArrayLike | None = None
+    ) -> jax.Array:
+        """
+        Log density convolved with per-value Gaussian errors ``err``: each of
+        the K truncated-Normal components is convolved with N(0, err) (see
+        ``stream_membership.distributions.convolved``), with the same
+        responsibilities as ``log_prob``. No support mask/sentinel is needed:
+        the convolved density is finite everywhere.
+
+        SPEED NOTE: by default (``exact_truncation=False``) the per-(star,
+        node) posterior-mass factor log[Phi(b') - Phi(a')] is dropped. It is
+        ~0 unless a star or node sits within a few sigma of the [low, high]
+        window edge (where the offtrack density is negligible anyway), but
+        computing it exactly for N stars x K ~ 400 nodes made each SVI step
+        ~4.5x slower (measured: 4.5 s vs 1.0 s per step at 40k stars x 400
+        nodes). Pass ``exact_truncation=True`` in the coordinate's
+        parameters to restore the exact version.
+        """
+        value = jnp.asarray(value)
+        err = jnp.asarray(err)
+        dt = self.compute_dtype
+
+        def _c(a):
+            return None if a is None else (jnp.asarray(a) if dt is None else jnp.asarray(a, dtype=dt))
+
+        # LA = log w_k + log N_k(x): (..., K), not normalised over k.
+        LA = self._log_weighted_anchors(x, dtype=dt)
+        own_log_probs = log_truncated_normal_convolved(
+            _c(value)[..., None],
+            _c(self.loc_vals),
+            _c(self.scale_vals),
+            _c(err)[..., None],
+            low=_c(self.low),
+            high=_c(self.high),
+            include_posterior_mass=self.exact_truncation,
+        )  # (..., K)
+        # sum_k r_k C_k with r = softmax(LA), in log space:
+        #   lse(log_softmax(LA) + C) = lse(LA + C) - lse(LA)
+        # This skips materialising the normalised responsibilities (one fewer
+        # (N, K) pass forward and backward), and lse(LA) is identical for
+        # coordinates sharing the same anchors (pm1/pm2), so XLA computes it once.
+        lse = jax.scipy.special.logsumexp
+        out = lse(LA + own_log_probs, axis=-1) - lse(LA, axis=-1)
+        return out.astype(value.dtype)
 
     def sample(
         self, key: jax.Array, sample_shape: tuple = (), x: ArrayLike | None = None

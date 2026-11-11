@@ -1,5 +1,6 @@
 __all__ = [
     "IsochroneCMD",
+    "dm_offset_curve",
     "KROUPA_SLOPES",
     "KROUPA_BREAKS",
     "SALPETER_SLOPES",
@@ -27,6 +28,20 @@ SALPETER_BREAKS = ()
 
 def _clip_preserve_gradients(x, min_, max_):
     return x + lax.stop_gradient(jnp.clip(x, min_, max_) - x)
+
+
+def dm_offset_curve(knots: ArrayLike, vals: ArrayLike, x: ArrayLike, k: int = 3) -> jax.Array:
+    """phi1-dependent distance-modulus offset: interpolating spline through
+    ``vals`` at ``knots``, evaluated at ``x``. Cubic with natural endpoints if
+    there are at least 4 knots, otherwise linear. Constant beyond the end
+    knots (x is clipped to the knot range). Used by ``IsochroneCMD``
+    when ``dm_knots`` is given (and by analysis code, to evaluate fitted
+    offsets the same way)."""
+    knots = jnp.asarray(knots)
+    k = int(k) if knots.shape[0] >= 4 else 1
+    kw = {"endpoints": "natural"} if k == 3 else {}
+    x = jnp.clip(jnp.asarray(x), knots[0], knots[-1])
+    return InterpolatedUnivariateSpline(knots, jnp.asarray(vals), k=k, **kw)(x)
 
 
 def _eval_poly(coeffs: ArrayLike, x: ArrayLike) -> jax.Array:
@@ -113,7 +128,16 @@ class IsochroneCMD(dist.Distribution):
         Valluri+24 track exactly). Can be passed a numpyro prior (via
         ``coord_parameters``) to let the joint fit calibrate for any small,
         phi1-independent mismatch between the fixed literature distance
-        track and this isochrone/photometric system.
+        track and this isochrone/photometric system. If ``dm_knots`` is
+        given, an array with one offset per knot instead (see below).
+    dm_knots (optional)
+        phi1 knots (degrees) of a phi1-dependent offset. ``None`` (default):
+        ``dm_offset`` is one constant. Otherwise the offset at phi1 is the
+        spline (``dm_offset_curve``) through ``dm_offset`` at these knots, so
+        the shape of the distance track can change too.
+    dm_spline_k (optional)
+        Degree of that spline (default 3, cubic with natural endpoints; 1 is
+        used when there are fewer than 4 knots).
     color_offset (optional)
         Additive offset (mag) applied to the isochrone's color, to absorb
         small systematics (e.g. reddening, metallicity, or model-isochrone
@@ -200,6 +224,8 @@ class IsochroneCMD(dist.Distribution):
         distmod_coeffs: ArrayLike,
         x: ArrayLike,
         dm_offset: ArrayLike = 0.0,
+        dm_knots: ArrayLike | None = None,
+        dm_spline_k: int = 3,
         color_offset: ArrayLike = 0.0,
         color_scale: ArrayLike = 0.05,
         spline_k: int = 1,
@@ -222,6 +248,8 @@ class IsochroneCMD(dist.Distribution):
         self.distmod_coeffs = jnp.asarray(distmod_coeffs)
         self.x = x
         self.dm_offset = dm_offset
+        self.dm_knots = None if dm_knots is None else jnp.asarray(dm_knots)
+        self.dm_spline_k = int(dm_spline_k)
         self.color_offset = color_offset
         self.color_scale = color_scale
         self.spline_k = spline_k
@@ -280,7 +308,15 @@ class IsochroneCMD(dist.Distribution):
         self._w_norm = jnp.trapezoid(self._w_q, self._M_q)
 
     def _distmod(self, x: ArrayLike) -> jax.Array:
-        return _eval_poly(self.distmod_coeffs, jnp.asarray(x)) + self.dm_offset
+        x = jnp.asarray(x)
+        return _eval_poly(self.distmod_coeffs, x) + self._dm_offset_at(x)
+
+    def _dm_offset_at(self, x: ArrayLike) -> jax.Array:
+        """Distance-modulus offset at phi1 = x (a constant unless dm_knots)."""
+        if self.dm_knots is None:
+            return self.dm_offset
+        flat = jnp.ravel(jnp.asarray(x))
+        return dm_offset_curve(self.dm_knots, self.dm_offset, flat, self.dm_spline_k).reshape(jnp.shape(x))
 
     def log_prob(
         self,

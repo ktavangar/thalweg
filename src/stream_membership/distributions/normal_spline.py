@@ -10,6 +10,8 @@ from jax import lax
 from jax.typing import ArrayLike
 from jax_cosmo.scipy.interpolate import InterpolatedUnivariateSpline
 
+from .convolved import log_normal_convolved, log_truncated_normal_convolved
+
 def _clip_preserve_gradients(x, min_, max_):
     return x + lax.stop_gradient(jnp.clip(x, min_, max_) - x)
 
@@ -125,6 +127,19 @@ class NormalSpline(dist.Distribution):
         """
         helper = self._make_helper_dist(x)
         return helper.log_prob(value)
+
+    def log_prob_convolved(
+        self, value: ArrayLike, err: ArrayLike, x: ArrayLike | None = None
+    ) -> jax.Array:
+        """
+        Log density of this distribution convolved with per-value Gaussian
+        measurement errors ``err``, i.e. ``Normal(loc(x), sqrt(scale(x)**2 +
+        err**2))``. The spline ``scale`` stays the intrinsic width. Used by the
+        model in place of per-star ``:modeldata`` latents; see
+        ``stream_membership.distributions.convolved``.
+        """
+        helper = self._make_helper_dist(x)
+        return log_normal_convolved(value, helper.loc, helper.scale, err)
 
 
 class TruncatedNormalSpline(NormalSpline):
@@ -255,6 +270,21 @@ class TruncatedNormalSpline(NormalSpline):
             scale=scale,
             low=self.low,
             high=self.high,
+        )
+
+    def log_prob_convolved(
+        self, value: ArrayLike, err: ArrayLike, x: ArrayLike | None = None
+    ) -> jax.Array:
+        """
+        Exact log density of this truncated Normal convolved with per-value
+        Gaussian measurement errors ``err`` (see
+        ``stream_membership.distributions.convolved``). Uses the same clipped
+        loc/scale as ``log_prob`` (including the NaN-guard margin above).
+        """
+        helper = self._make_helper_dist(x)
+        base = getattr(helper, "base_dist", helper)  # plain Normal if untruncated
+        return log_truncated_normal_convolved(
+            value, base.loc, base.scale, err, low=self.low, high=self.high
         )
 
     @property

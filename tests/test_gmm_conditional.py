@@ -596,3 +596,33 @@ def test_to_scalar_mixture_vectorized_matches_loop():
     assert jnp.allclose(grad(False), grad(True), atol=1e-8)
     # out of bounds: finite, no NaN gradients
     assert jnp.isfinite(vec.log_prob(jnp.array([-50.0, 20.0]))).all()
+
+
+def test_precomputed_anchors_and_compute_dtype_match_direct():
+    """`log_prob_convolved` with `PrecomputedAnchors` (+ float32 compute) must
+    match the direct float64 evaluation for a fixed 2D (phi1, phi2) grid."""
+    from stream_membership.distributions import PrecomputedAnchors
+
+    rng = np.random.default_rng(0)
+    K, N = 12, 200
+    locs = jnp.stack([jnp.linspace(-9, 9, K), jnp.tile(jnp.array([-1.0, 1.0]), K // 2)])
+    scales = jnp.broadcast_to(jnp.array([[1.5], [0.7]]), (2, K))
+    low, high = jnp.array([[-10.0], [-3.0]]), jnp.array([[10.0], [3.0]])
+    grid = IndependentGMM(
+        dist.CategoricalLogits(jnp.asarray(rng.normal(size=K))),
+        locs=locs, scales=scales, low=low, high=high,
+    )
+    x = jnp.stack([rng.uniform(-10, 10, N), rng.uniform(-3, 3, N)], axis=-1)
+    value = jnp.asarray(rng.normal(size=N))
+    err = jnp.asarray(rng.uniform(0.05, 0.5, N))
+    kw = dict(loc_vals=jnp.asarray(rng.normal(size=K)), scale_vals=jnp.full(K, 0.4),
+              x=x, low=-5.0, high=5.0)
+
+    direct = TruncatedNormalGMMConditional(grid, **kw).log_prob_convolved(value, err)
+    for dtype, tol in [(None, 1e-10), (jnp.float32, 1e-4)]:
+        anchors = PrecomputedAnchors(locs, scales, x, low=low, high=high, dtype=dtype)
+        fast = TruncatedNormalGMMConditional(
+            grid, **kw, anchor_log_probs=anchors, compute_dtype=dtype
+        ).log_prob_convolved(value, err)
+        assert fast.dtype == direct.dtype
+        np.testing.assert_allclose(fast, direct, rtol=tol, atol=tol)

@@ -95,3 +95,21 @@ def test_methods(dist_):
 
 
 # TODO: test that evaluating spline log_prob with an extra event_dim is ignored...?
+
+
+def test_truncated_normal_convolved_matches_quadrature():
+    """Exact error-convolved truncated Normal vs. numerical integration."""
+    from scipy.integrate import quad
+    from scipy.stats import norm, truncnorm
+
+    from stream_membership.distributions import log_truncated_normal_convolved
+
+    mu, sig, err, lo, hi = 0.3, 0.7, 0.4, -1.0, 2.0
+    for x in [-2.5, -1.0, 0.0, 1.5, 3.0]:
+        def f(t, x=x):
+            a, b = (lo - mu) / sig, (hi - mu) / sig
+            return truncnorm.pdf(t, a, b, mu, sig) * norm.pdf(x, t, err)
+
+        ref = quad(f, lo, hi)[0]
+        got = float(log_truncated_normal_convolved(x, mu, sig, err, lo, hi))
+        np.testing.assert_allclose(got, np.log(ref), rtol=1e-8)

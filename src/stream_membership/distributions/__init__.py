@@ -1,3 +1,4 @@
+from .convolved import *
 from .concatenated import *
 from .dirichlet_spline import *
 from .flow import *
